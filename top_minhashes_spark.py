@@ -69,6 +69,7 @@ import argparse
 import os
 import sys
 from typing import List
+import glob
 
 from pyspark.sql import SparkSession, DataFrame, functions as F, types as T
 
@@ -162,10 +163,10 @@ def read_raw_dataset(spark: SparkSession, args: argparse.Namespace) -> DataFrame
     Applies optional filters (ksize), sampling, and file limiting.
     """
     if args.file_limit:
-        files = list_some_files(spark, args.input, args.file_limit)
-        if not files:
+        paths = sorted(glob.glob(os.path.join(args.input, "**/*.parquet"), recursive=True))[:args.file_limit]
+        if not paths:
             raise RuntimeError("No files found under input path.")
-        df = spark.read.parquet(*files)
+        df = spark.read.parquet(*paths)
     else:
         df = spark.read.parquet(args.input)
 
