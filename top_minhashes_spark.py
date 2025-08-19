@@ -174,10 +174,11 @@ def read_raw_dataset(spark: SparkSession, args: argparse.Namespace) -> DataFrame
     if "min_hash" not in cols or "sample_id" not in cols:
         raise RuntimeError("Input parquet must contain columns: min_hash (int64), sample_id (string).")
 
+    extra = [F.col("ksize")] if "ksize" in cols else []
     df = df.select(
         F.col("min_hash").cast(T.LongType()).alias("min_hash"),
         F.col("sample_id").cast(T.StringType()).alias("sample_id"),
-        *(F.col("ksize") if "ksize" in cols else [])
+        *extra
     )
 
     if args.ksize is not None and "ksize" in df.columns:
