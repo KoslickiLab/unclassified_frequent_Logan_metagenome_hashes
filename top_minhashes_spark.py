@@ -201,26 +201,16 @@ def stage_counts(spark: SparkSession, args: argparse.Namespace, df_raw: DataFram
     Compute exact distinct counts per min_hash and write partitioned Parquet.
     """
     out_counts = os.path.join(args.out, "counts_parquet")
-    bucket_col = F.pmod(F.col("min_hash"), F.lit(args.num_buckets)).cast(T.IntegerType()).alias("bucket")
 
+    pairs = df_raw.select("min_hash", "sample_id").dropDuplicates()
     counts_df = (
-        df_raw
-        .select("min_hash", "sample_id")
-        .groupBy("min_hash")
-        .agg(F.countDistinct("sample_id").alias("n_samples"))
-        .withColumn("bucket", bucket_col)
+        pairs.groupBy("min_hash")
+        .agg(F.count(F.lit(1)).alias("n_samples"))
+        .withColumn("bucket", F.pmod(F.col("min_hash"), F.lit(args.num_buckets)).cast(T.IntegerType()))
     )
-
-    # Repartition by bucket to balance output files
     counts_df = counts_df.repartition(args.num_buckets, "bucket")
+    counts_df.write.mode("overwrite").partitionBy("bucket").parquet(out_counts)
 
-    (
-        counts_df
-        .write
-        .mode("overwrite")
-        .partitionBy("bucket")
-        .parquet(out_counts)
-    )
     print(f"[counts] wrote: {out_counts}")
 
 
