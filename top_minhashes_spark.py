@@ -19,6 +19,7 @@ import sys
 import glob
 from datetime import datetime, timezone
 from typing import List, Optional
+import math
 
 from pyspark.sql import SparkSession, DataFrame, functions as F, types as T
 
@@ -46,6 +47,12 @@ def parse_args() -> argparse.Namespace:
                    help="Optional row-level sampling fraction in (0,1] for dry-run sanity checks.")
     p.add_argument("--file-limit", type=int, default=None,
                    help="Optional: limit number of input Parquet files scanned (dry-run).")
+    p.add_argument("--auto-shuffle", action="store_true",
+                   help="Auto-tune shuffle partitions from input size to keep shuffle blocks reasonable.")
+    p.add_argument("--target-shuffle-blocks", type=int, default=50_000_000,
+                   help="Upper bound for (#map_splits × #shuffle_partitions). Used only with --auto-shuffle.")
+    p.add_argument("--local-dirs", default=None,
+                   help="Comma-separated local dirs for Spark spills (overrides SPARK_LOCAL_DIRS).")
 
     # Spark resources / tuning
     p.add_argument("--seed", type=int, default=1337, help="Random seed for sampling.")
@@ -86,11 +93,45 @@ def utc_run_id(custom: Optional[str]) -> str:
     # Example: 20250819T160455Z
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
+import math
+
+def estimate_input_splits(input_path: str, max_partition_bytes: str) -> int:
+    # Parse "64m", "512m", "1g" etc.
+    unit = max_partition_bytes[-1].lower()
+    factor = {"k": 1<<10, "m": 1<<20, "g": 1<<30}.get(unit, 1)
+    try:
+        size_bytes = int(max_partition_bytes[:-1]) * factor if unit in "kmg" else int(max_partition_bytes)
+    except Exception:
+        size_bytes = 512 * (1<<20)  # fallback 512m
+
+    total_bytes = 0
+    for root, _, files in os.walk(input_path):
+        for f in files:
+            if f.endswith(".parquet"):
+                try:
+                    total_bytes += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    pass
+    # splits ≈ sum(ceil(file_size / maxPartitionBytes))
+    # This is an over-estimate; good enough to choose a safe shuffle partitions value.
+    est_files = max(1, total_bytes // (1<<30))  # crude fallback if sizes not readable
+    splits = 0
+    for root, _, files in os.walk(input_path):
+        for f in files:
+            if f.endswith(".parquet"):
+                try:
+                    b = os.path.getsize(os.path.join(root, f))
+                    splits += max(1, math.ceil(b / size_bytes))
+                except OSError:
+                    pass
+    return splits if splits > 0 else max(1, est_files)
+
 
 # -----------------------
 # Spark session
 # -----------------------
 def build_spark(args: argparse.Namespace) -> SparkSession:
+    # Base builder
     builder = (
         SparkSession.builder
         .appName("TopMinhashesDistinctSamples")
@@ -102,9 +143,25 @@ def build_spark(args: argparse.Namespace) -> SparkSession:
         .config("spark.sql.parquet.filterPushdown", "true")
         .config("spark.sql.parquet.mergeSchema", "false")
         .config("spark.sql.parquet.enableVectorizedReader", "true")
-        # Avoid writing _SUCCESS in many cases (still delete it explicitly later to be safe)
         .config("spark.hadoop.mapreduce.fileoutputcommitter.marksuccessfuljobs", "false")
+
+        # Favor execution memory; avoid giant shuffle pages; stronger AQE hints
+        .config("spark.memory.fraction", "0.80")
+        .config("spark.memory.storageFraction", "0.20")
+        .config("spark.buffer.pageSize", "32m")
+        .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
+        .config("spark.sql.adaptive.advisoryPartitionSizeInBytes", "512m")
+        .config("spark.sql.adaptive.skewJoin.enabled", "true")
+        .config("spark.sql.adaptive.skewedPartitionThresholdInBytes", "256m")
+        .config("spark.shuffle.compress", "true")
+        .config("spark.shuffle.spill.compress", "true")
+        .config("spark.shuffle.file.buffer", "512k")
     )
+
+    if args.local_dirs:
+        builder = builder.config("spark.local.dir", args.local_dirs)
+    else:
+        builder = builder.config("spark.local.dir", os.environ.get("SPARK_LOCAL_DIRS", "/tmp/spark_local"))
 
     if args.local_cores:
         builder = builder.master(f"local[{args.local_cores}]")
@@ -114,9 +171,29 @@ def build_spark(args: argparse.Namespace) -> SparkSession:
     if args.executor_memory:
         builder = builder.config("spark.executor.memory", args.executor_memory)
 
+    # Create session first (for logging), then optionally auto-tune shuffle partitions.
     spark = builder.getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
+
+    if args.auto_shuffle:
+        # Estimate input splits from file sizes + maxPartitionBytes
+        try:
+            splits = estimate_input_splits(args.input, args.max_partition_bytes)
+        except Exception:
+            splits = None
+        if splits and splits > 0:
+            # Choose shuffle partitions so splits * reduces <= target blocks
+            # Clamp to a reasonable range [1024, 16384]
+            max_blocks = max(10_000_000, int(args.target_shuffle_blocks))
+            reduces = max(1024, min(16384, max(1, max_blocks // splits)))
+            spark.conf.set("spark.sql.shuffle.partitions", str(reduces))
+            print(f"[auto-shuffle] input_splits≈{splits}, targetBlocks={max_blocks} -> "
+                  f"shuffle.partitions={reduces}")
+        else:
+            print("[auto-shuffle] Could not estimate input_splits; using provided --shuffle-partitions")
+
     return spark
+
 
 
 # -----------------------
