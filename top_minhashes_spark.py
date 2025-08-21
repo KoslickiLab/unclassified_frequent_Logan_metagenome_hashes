@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Exact top-N min_hash by distinct sample_id count, with (for chosen N) the list of sample_ids per hash.
+Exact top-N min_hash by distinct sample_id count, plus (for chosen N) the list of sample_ids per hash.
 
 - Multi-executor single-host via Spark's local-cluster master (recommended).
-- Falls back to single-JVM local[...] mode if local-cluster is unavailable.
-- Early dedupe of (min_hash, sample_id) → exact counts with smaller shuffle.
-- Auto-tuned shuffle partitions from input split estimate (keeps block count sane).
-- 32 MiB shuffle pages to avoid 1 GiB allocations.
-- Versioned outputs, clean filenames, no stomping.
+- Falls back to single-JVM local[...] if local-cluster is unavailable.
+- Exact counts without early global dropDuplicates (uses 2-level GROUP BY to reduce memory spikes).
+- Forces sort-based aggregates to avoid big in-memory hash sets; clamps shuffle page size to 32 MiB.
+- Auto-tunes shuffle partitions from input split estimate to keep #shuffle blocks reasonable.
+- SSD spill dirs, extended timeouts, versioned outputs with clean filenames (no stomping).
 """
 
 import argparse
@@ -29,42 +29,41 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
 
-    # Required
-    p.add_argument("--input", required=True, help="Input Parquet root (needs min_hash:int64, sample_id:string).")
+    # Required I/O + stages
+    p.add_argument("--input", required=True, help="Input Parquet root (requires min_hash:int64, sample_id:string).")
     p.add_argument("--out",   required=True, help="Output root directory.")
     p.add_argument("--stage", nargs="+", required=True, choices=["counts", "topn", "ids"],
                    help="Stages to run. Run 'counts' once; reuse for 'topn' and 'ids'.")
 
-    # Analysis
+    # Analysis parameters
     p.add_argument("--topN", type=int, default=100, help="Top N hashes (for topn and ids).")
     p.add_argument("--ksize", type=int, default=None, help="Optional filter on ksize if present.")
 
     # Run identity
-    p.add_argument("--run-tag", default=None,
-                   help="Optional run label (else UTC like 20250820T211234Z).")
+    p.add_argument("--run-tag", default=None, help="Optional run label; else UTC timestamp.")
 
-    # Execution mode (local-cluster preferred)
+    # Execution mode (multi-executor by default)
     p.add_argument("--mode", choices=["local-cluster", "local"], default="local-cluster",
-                   help="Multi-executor local-cluster (recommended) or single-JVM local.")
+                   help="Use multi-executor local-cluster (recommended) or single-JVM local.")
 
     # local-cluster knobs (Spark wants MB; we accept g/m and convert)
     p.add_argument("--executors", type=int, default=16, help="Executors (workers) for local-cluster.")
     p.add_argument("--cores-per-exec", type=int, default=8, help="Cores per executor.")
-    p.add_argument("--mem-per-exec", default="220g",
-                   help="Memory per executor (e.g., 220g, 196g, or MB integer).")
+    p.add_argument("--mem-per-exec", default="128g",
+                   help="Memory per executor (e.g., 128g, 96g, or MB integer).")
 
     # local (single-JVM) fallback knobs
     p.add_argument("--local-cores", type=int, default=128, help="Cores in single-JVM local mode.")
-    p.add_argument("--driver-memory", default="32g", help="Driver heap (kept moderate to avoid map_count warnings).")
-    p.add_argument("--executor-memory", default="3500g", help="Executor heap in local mode.")
+    p.add_argument("--driver-memory", default="32g", help="Driver heap (kept moderate for JDK11).")
+    p.add_argument("--executor-memory", default="1500g", help="Executor heap in local mode (single JVM).")
 
-    # Spill dirs
+    # Spill dirs (SSD)
     p.add_argument("--local-dirs", default="/scratch/spark_local",
-                   help="Comma-separated spill dirs (ensure they exist; use SSD).")
+                   help="Comma-separated spill dirs (created if missing).")
 
     # Performance
-    p.add_argument("--max-partition-bytes", default="1g",
-                   help="Read split size (e.g., 512m, 1g). Larger => fewer map tasks.")
+    p.add_argument("--max-partition-bytes", default="512m",
+                   help="Read split size (e.g., 256m, 512m, 1g). Larger => fewer map tasks.")
     p.add_argument("--target-shuffle-blocks", type=int, default=30_000_000,
                    help="Upper bound for (#map_splits × #reduce_partitions).")
 
@@ -98,29 +97,23 @@ def ensure_dirs(paths_csv: str) -> None:
 
 def parse_size_to_bytes(s: str) -> int:
     s = s.strip().lower()
-    if s.endswith("k"):
-        return int(s[:-1]) * (1 << 10)
-    if s.endswith("m"):
-        return int(s[:-1]) * (1 << 20)
-    if s.endswith("g"):
-        return int(s[:-1]) * (1 << 30)
+    if s.endswith("k"): return int(s[:-1]) * (1 << 10)
+    if s.endswith("m"): return int(s[:-1]) * (1 << 20)
+    if s.endswith("g"): return int(s[:-1]) * (1 << 30)
     return int(s)
 
 
 def parse_size_to_mb(s: str) -> int:
     s = s.strip().lower()
-    if s.endswith("k"):
-        return max(1, int(int(s[:-1]) // 1024))
-    if s.endswith("m"):
-        return int(s[:-1])
-    if s.endswith("g"):
-        return int(s[:-1]) * 1024
+    if s.endswith("k"): return max(1, int(int(s[:-1]) // 1024))
+    if s.endswith("m"): return int(s[:-1])
+    if s.endswith("g"): return int(s[:-1]) * 1024
     return int(s)  # assume already MB
 
 
 def estimate_input_splits_localfs(input_path: str, max_partition_bytes: str) -> int:
     mpb = parse_size_to_bytes(max_partition_bytes)
-    total_splits = 0
+    splits = 0
     for root, _, files in os.walk(input_path):
         for f in files:
             if f.endswith(".parquet"):
@@ -129,11 +122,11 @@ def estimate_input_splits_localfs(input_path: str, max_partition_bytes: str) -> 
                     size = os.path.getsize(p)
                 except OSError:
                     size = 0
-                total_splits += max(1, math.ceil(size / mpb)) if size > 0 else 1
-    return max(1, total_splits)
+                splits += max(1, math.ceil(size / mpb)) if size > 0 else 1
+    return max(1, splits)
 
 
-# Hadoop FS helpers (for clean renaming)
+# Hadoop FS helpers (rename/cleanup)
 def _jvm(spark: SparkSession):
     return spark._jvm
 
@@ -164,7 +157,7 @@ def rename_and_clean_parts(
             parts.append(name)
     parts.sort()
     if not parts:
-        raise RuntimeError(f"No part-*.json(.gz) found in {out_dir}. Increase --json-coalesce if needed.")
+        raise RuntimeError(f"No part-*.json(.gz) found in {out_dir}.")
 
     fs = get_hadoop_fs(spark, out_dir)
     ext = ".json.gz" if compressed else ".json"
@@ -207,11 +200,14 @@ def build_spark(args: argparse.Namespace) -> SparkSession:
         .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
         .config("spark.driver.maxResultSize", "0")
         .config("spark.hadoop.mapreduce.fileoutputcommitter.marksuccessfuljobs", "false")
-        # Memory
+        # Memory behavior
         .config("spark.memory.fraction", "0.80")
         .config("spark.memory.storageFraction", "0.20")
-        .config("spark.buffer.pageSize", "32m")
-        # AQE coalesce
+        .config("spark.buffer.pageSize", "32m")  # clamp shuffle pages
+        # Prefer sort-based aggregation to avoid huge in-memory hash sets
+        .config("spark.sql.execution.useObjectHashAggregate", "false")
+        .config("spark.sql.execution.sortBeforeRepartition", "true")
+        # AQE guidance
         .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
         .config("spark.sql.adaptive.advisoryPartitionSizeInBytes", "512m")
         .config("spark.sql.adaptive.skewJoin.enabled", "true")
@@ -226,11 +222,13 @@ def build_spark(args: argparse.Namespace) -> SparkSession:
         .config("spark.sql.broadcastTimeout", "3600s")
         # Spill dirs
         .config("spark.local.dir", args.local_dirs)
+        # JDK11-friendly GC knob: larger G1 regions reduce memory-mapping pressure
+        .config("spark.executor.extraJavaOptions", "-XX:+UseG1GC -XX:G1HeapRegionSize=32m")
+        .config("spark.driver.extraJavaOptions",   "-XX:+UseG1GC -XX:G1HeapRegionSize=32m")
     )
 
-    # Choose master
     if args.mode == "local-cluster":
-        mem_mb = parse_size_to_mb(args.mem_per_exec)
+        mem_mb = parse_size_to_mb(args.mem_per_exec)  # MB required
         master = f"local-cluster[{args.executors},{args.cores_per_exec},{mem_mb}]"
         builder = base.master(master).config("spark.driver.memory", args.driver_memory)
     else:
@@ -243,7 +241,6 @@ def build_spark(args: argparse.Namespace) -> SparkSession:
         spark = builder.getOrCreate()
     except Exception as e:
         if args.mode == "local-cluster":
-            # Fall back to single-JVM local mode
             print(f"[warn] Failed to start master {master}: {e}")
             print("[warn] Falling back to single-JVM local mode.")
             master_fallback = f"local[{args.local_cores}]"
@@ -256,7 +253,7 @@ def build_spark(args: argparse.Namespace) -> SparkSession:
 
     print(f"[spark] master = {spark.sparkContext.master}")
 
-    # Auto-tune reduce partitions: keep (#splits × #reduces) under target
+    # Auto-tune reduce partitions: (#splits × #reduces) <= target
     try:
         splits = estimate_input_splits_localfs(args.input, args.max_partition_bytes)
         target = max(10_000_000, int(args.target_shuffle_blocks))
@@ -307,13 +304,26 @@ def read_raw_dataset(spark: SparkSession, args: argparse.Namespace) -> DataFrame
 
 # ----------------------- Stages -----------------------
 
-COUNTS_PARTS = 8192  # partition count for counts output (by bucket)
+COUNTS_PARTS = 8192  # partitions for counts output (bucketed)
 
 def stage_counts(spark: SparkSession, args: argparse.Namespace, df_raw: DataFrame) -> None:
+    """
+    Exact counts without early global dropDuplicates:
+      1) pairs = GROUP BY (min_hash, sample_id)
+      2) counts = GROUP BY min_hash over the collapsed pairs
+    """
     out_counts = os.path.join(args.out, "counts_parquet")
 
-    pairs = df_raw.select("min_hash", "sample_id").dropDuplicates(["min_hash", "sample_id"])
+    # 1) Collapse duplicate pairs exactly
+    pairs = (
+        df_raw
+        .select("min_hash", "sample_id")
+        .groupBy("min_hash", "sample_id")
+        .agg(F.count(F.lit(1)).alias("pair_count"))   # value unused; forces exact dedup via sort-based agg
+        .select("min_hash", "sample_id")
+    )
 
+    # 2) Count distinct sample_ids per min_hash exactly
     counts_df = (
         pairs
         .groupBy("min_hash")
@@ -373,7 +383,7 @@ def stage_ids(spark: SparkSession, args: argparse.Namespace, df_raw: DataFrame, 
 
     topn_keys = topn_df.select("min_hash")
 
-    # Broadcast only for modest topN; else disable to conserve driver memory
+    # When N is very large, avoid broadcast to conserve driver memory
     if args.topN <= 5_000_000:
         join_keys = F.broadcast(topn_keys)
     else:
@@ -381,8 +391,16 @@ def stage_ids(spark: SparkSession, args: argparse.Namespace, df_raw: DataFrame, 
         join_keys = topn_keys
 
     filtered = df_raw.join(join_keys, on="min_hash", how="inner").select("min_hash", "sample_id")
-    distinct_pairs = filtered.dropDuplicates(["min_hash", "sample_id"])
 
+    # Collapse duplicate pairs for these keys (exact)
+    distinct_pairs = (
+        filtered
+        .groupBy("min_hash", "sample_id")
+        .agg(F.count(F.lit(1)).alias("pair_count"))
+        .select("min_hash", "sample_id")
+    )
+
+    # Build sample lists per min_hash
     agg_df = (
         distinct_pairs
         .groupBy("min_hash")
