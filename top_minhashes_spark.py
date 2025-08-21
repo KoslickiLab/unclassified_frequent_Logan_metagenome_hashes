@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+Note: the code two commits ago (I think before f397466..02567cc) works if you give the executor a ton more memory
 top_minhashes_spark.py
 
 Exact, scalable computation of the top-N min_hash values by the number of distinct sample_ids
