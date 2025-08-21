@@ -1,49 +1,13 @@
 #!/usr/bin/env python3
 """
-top_minhashes_spark.py
+Exact top-N min_hash by distinct sample_id count, with (for chosen N) the list of sample_ids per hash.
 
-Exact top-N min_hash by distinct sample_id count, plus (for chosen N) the list of sample_ids per hash.
-
-Design
-------
-- Runs best as a multi-executor, single-host "cluster" using Spark's local-cluster mode:
-    executors × cores-per-exec × mem-per-exec (MB).
-  If local-cluster isn't supported by your Spark build, the script falls back to local mode automatically.
-- Exact counts: dropDuplicates(min_hash, sample_id) -> groupBy(min_hash).count().
-- Reusable intermediate: counts_parquet/ (partitioned by bucket).
-- Versioned outputs: topn_parquet/topN=.../run=... and topn_json/.../run=..., etc.
-- Clean filenames: single/multi-part JSONs are renamed to readable names; _SUCCESS and part-* leftovers removed.
-- Auto-shuffle: choose spark.sql.shuffle.partitions from input split estimate to keep total shuffle blocks ≤ target.
-
-Typical usage
--------------
-# 1) Full counts (heaviest)
-python top_minhashes_spark.py \
-  --input /scratch/.../signature_mins \
-  --out   /scratch/full_output \
-  --stage counts \
-  --ksize 31
-
-# 2) Top-N summary (large N OK if you shard JSON)
-python top_minhashes_spark.py \
-  --input /scratch/.../signature_mins \
-  --out   /scratch/full_output \
-  --stage topn \
-  --ksize 31 \
-  --topN 100000000 \
-  --json-coalesce 512 \
-  --run-tag topn_100m
-
-# 3) IDs for a manageable N (e.g., 100k); shard as needed
-python top_minhashes_spark.py \
-  --input /scratch/.../signature_mins \
-  --out   /scratch/full_output \
-  --stage ids \
-  --ksize 31 \
-  --topN 100000 \
-  --json-coalesce 256 \
-  --compress-json \
-  --run-tag ids_100k
+- Multi-executor single-host via Spark's local-cluster master (recommended).
+- Falls back to single-JVM local[...] mode if local-cluster is unavailable.
+- Early dedupe of (min_hash, sample_id) → exact counts with smaller shuffle.
+- Auto-tuned shuffle partitions from input split estimate (keeps block count sane).
+- 32 MiB shuffle pages to avoid 1 GiB allocations.
+- Versioned outputs, clean filenames, no stomping.
 """
 
 import argparse
@@ -57,9 +21,7 @@ from typing import Optional, List
 from pyspark.sql import SparkSession, DataFrame, functions as F, types as T
 
 
-# -----------------------
-# CLI
-# -----------------------
+# ----------------------- CLI -----------------------
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -67,63 +29,61 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
 
-    # Required I/O + stages
+    # Required
     p.add_argument("--input", required=True, help="Input Parquet root (needs min_hash:int64, sample_id:string).")
     p.add_argument("--out",   required=True, help="Output root directory.")
     p.add_argument("--stage", nargs="+", required=True, choices=["counts", "topn", "ids"],
-                   help="Stages to run. Run 'counts' once; reuse for 'topn' and 'ids' later.")
+                   help="Stages to run. Run 'counts' once; reuse for 'topn' and 'ids'.")
 
-    # Analysis parameters
-    p.add_argument("--topN", type=int, default=100, help="Top N hashes (for topn and ids stages).")
+    # Analysis
+    p.add_argument("--topN", type=int, default=100, help="Top N hashes (for topn and ids).")
     p.add_argument("--ksize", type=int, default=None, help="Optional filter on ksize if present.")
 
     # Run identity
     p.add_argument("--run-tag", default=None,
-                   help="Optional run label; if omitted, use UTC timestamp (YYYYMMDDThhmmssZ).")
+                   help="Optional run label (else UTC like 20250820T211234Z).")
 
-    # Execution mode (multi-executor by default)
+    # Execution mode (local-cluster preferred)
     p.add_argument("--mode", choices=["local-cluster", "local"], default="local-cluster",
-                   help="Use multi-executor local-cluster (recommended) or single-JVM local mode.")
+                   help="Multi-executor local-cluster (recommended) or single-JVM local.")
 
-    # local-cluster knobs (MB memory is required by Spark; we accept 'g/m' and convert)
-    p.add_argument("--executors", type=int, default=16, help="Executors (workers) in local-cluster mode.")
-    p.add_argument("--cores-per-exec", type=int, default=8, help="Cores per executor in local-cluster mode.")
+    # local-cluster knobs (Spark wants MB; we accept g/m and convert)
+    p.add_argument("--executors", type=int, default=16, help="Executors (workers) for local-cluster.")
+    p.add_argument("--cores-per-exec", type=int, default=8, help="Cores per executor.")
     p.add_argument("--mem-per-exec", default="220g",
-                   help="Memory per executor in local-cluster mode (e.g., 220g, 196g, or MB integer).")
+                   help="Memory per executor (e.g., 220g, 196g, or MB integer).")
 
-    # local (single-JVM) fallback knobs (used only if --mode local OR local-cluster unsupported)
+    # local (single-JVM) fallback knobs
     p.add_argument("--local-cores", type=int, default=128, help="Cores in single-JVM local mode.")
-    p.add_argument("--driver-memory", default="64g", help="Driver memory (both modes).")
-    p.add_argument("--executor-memory", default="3500g", help="Executor memory in single-JVM local mode.")
+    p.add_argument("--driver-memory", default="32g", help="Driver heap (kept moderate to avoid map_count warnings).")
+    p.add_argument("--executor-memory", default="3500g", help="Executor heap in local mode.")
 
     # Spill dirs
     p.add_argument("--local-dirs", default="/scratch/spark_local",
-                   help="Comma-separated local dirs for Spark spills.")
+                   help="Comma-separated spill dirs (ensure they exist; use SSD).")
 
-    # Performance knobs
+    # Performance
     p.add_argument("--max-partition-bytes", default="1g",
-                   help="Split size when reading files (e.g., 512m, 1g). Larger => fewer map tasks.")
+                   help="Read split size (e.g., 512m, 1g). Larger => fewer map tasks.")
     p.add_argument("--target-shuffle-blocks", type=int, default=30_000_000,
-                   help="Upper bound for (#map_splits × #reduce_partitions). Used for auto-tuning reduces.")
+                   help="Upper bound for (#map_splits × #reduce_partitions).")
 
     # Output shaping
     p.add_argument("--json-coalesce", type=int, default=1,
-                   help="How many JSON files to create (higher for large N).")
+                   help="How many JSON files to create (raise for large N).")
     p.add_argument("--compress-json", action="store_true",
                    help="Write JSON compressed with gzip.")
 
     # Dry-run
     p.add_argument("--sample-fraction", type=float, default=None,
-                   help="Row-level sample fraction (0 < f ≤ 1) for quick tests.")
+                   help="Row-level sample fraction (0 < f ≤ 1) for a quick test.")
     p.add_argument("--limit-files", type=int, default=None,
-                   help="Limit # of Parquet files read (quick tests).")
+                   help="Limit # of Parquet files read (quick test).")
 
     return p.parse_args()
 
 
-# -----------------------
-# Helpers
-# -----------------------
+# ----------------------- Helpers -----------------------
 
 def utc_run_id(custom: Optional[str]) -> str:
     return custom or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -148,7 +108,6 @@ def parse_size_to_bytes(s: str) -> int:
 
 
 def parse_size_to_mb(s: str) -> int:
-    # Spark's local-cluster requires memory per worker in MB (plain integer).
     s = s.strip().lower()
     if s.endswith("k"):
         return max(1, int(int(s[:-1]) // 1024))
@@ -156,12 +115,10 @@ def parse_size_to_mb(s: str) -> int:
         return int(s[:-1])
     if s.endswith("g"):
         return int(s[:-1]) * 1024
-    # assume it's already MB
-    return int(s)
+    return int(s)  # assume already MB
 
 
 def estimate_input_splits_localfs(input_path: str, max_partition_bytes: str) -> int:
-    """Estimate number of input splits for local filesystem by file sizes."""
     mpb = parse_size_to_bytes(max_partition_bytes)
     total_splits = 0
     for root, _, files in os.walk(input_path):
@@ -176,7 +133,7 @@ def estimate_input_splits_localfs(input_path: str, max_partition_bytes: str) -> 
     return max(1, total_splits)
 
 
-# Hadoop FS helpers for rename/cleanup
+# Hadoop FS helpers (for clean renaming)
 def _jvm(spark: SparkSession):
     return spark._jvm
 
@@ -199,7 +156,6 @@ def rename_and_clean_parts(
     final_filename_base: str,
     compressed: bool
 ) -> List[str]:
-    """Rename part-*.json(.gz) to readable names; remove _SUCCESS, .crc, extra part-*."""
     statuses = list_status(spark, out_dir)
     parts = []
     for st in statuses:
@@ -208,7 +164,7 @@ def rename_and_clean_parts(
             parts.append(name)
     parts.sort()
     if not parts:
-        raise RuntimeError(f"No part-*.json(.gz) found in {out_dir}. Increase --json-coalesce as needed.")
+        raise RuntimeError(f"No part-*.json(.gz) found in {out_dir}. Increase --json-coalesce if needed.")
 
     fs = get_hadoop_fs(spark, out_dir)
     ext = ".json.gz" if compressed else ".json"
@@ -232,19 +188,17 @@ def rename_and_clean_parts(
     return finals
 
 
-# -----------------------
-# Spark session
-# -----------------------
+# ----------------------- Spark session -----------------------
 
 def build_spark(args: argparse.Namespace) -> SparkSession:
     # Ensure spill dirs exist and advertise to Spark
     ensure_dirs(args.local_dirs)
     os.environ["SPARK_LOCAL_DIRS"] = args.local_dirs
 
-    builder = (
+    base = (
         SparkSession.builder
         .appName("TopMinhashesDistinctSamples")
-        # Core I/O + performance
+        # IO/perf
         .config("spark.sql.adaptive.enabled", "true")
         .config("spark.sql.files.maxPartitionBytes", args.max_partition_bytes)
         .config("spark.sql.parquet.filterPushdown", "true")
@@ -253,20 +207,19 @@ def build_spark(args: argparse.Namespace) -> SparkSession:
         .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
         .config("spark.driver.maxResultSize", "0")
         .config("spark.hadoop.mapreduce.fileoutputcommitter.marksuccessfuljobs", "false")
-        # Memory behavior
+        # Memory
         .config("spark.memory.fraction", "0.80")
         .config("spark.memory.storageFraction", "0.20")
-        .config("spark.buffer.pageSize", "32m")  # clamp shuffle pages
-        # AQE guidance
+        .config("spark.buffer.pageSize", "32m")
+        # AQE coalesce
         .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
         .config("spark.sql.adaptive.advisoryPartitionSizeInBytes", "512m")
         .config("spark.sql.adaptive.skewJoin.enabled", "true")
-        .config("spark.sql.adaptive.skewedPartitionThresholdInBytes", "256m")
-        # Shuffle robustness
+        # Shuffle/IO
         .config("spark.shuffle.compress", "true")
         .config("spark.shuffle.spill.compress", "true")
         .config("spark.shuffle.file.buffer", "512k")
-        # Heartbeats & RPC
+        # Heartbeats/RPC
         .config("spark.network.timeout", "800s")
         .config("spark.executor.heartbeatInterval", "20s")
         .config("spark.rpc.message.maxSize", "512")
@@ -275,42 +228,35 @@ def build_spark(args: argparse.Namespace) -> SparkSession:
         .config("spark.local.dir", args.local_dirs)
     )
 
-    # Master selection
+    # Choose master
     if args.mode == "local-cluster":
         mem_mb = parse_size_to_mb(args.mem_per_exec)
-        master = f"local-cluster[{args.executors},{args.cores-per-exec},{mem_mb}]"
-        # hyphen is not valid attr; use underscore variable name
-    # fix attribute access typo
-    return _build_spark_with_master(builder, args, mem_mb)
+        master = f"local-cluster[{args.executors},{args.cores_per_exec},{mem_mb}]"
+        builder = base.master(master).config("spark.driver.memory", args.driver_memory)
+    else:
+        master = f"local[{args.local_cores}]"
+        builder = (base.master(master)
+                        .config("spark.driver.memory", args.driver_memory)
+                        .config("spark.executor.memory", args.executor_memory))
 
-
-def _build_spark_with_master(builder, args, mem_mb: Optional[int] = None) -> SparkSession:
-    # helper to build with proper master; handles fallback if needed
     try:
-        if args.mode == "local-cluster":
-            master = f"local-cluster[{args.executors},{args.cores_per_exec},{mem_mb}]"
-            b = builder.master(master).config("spark.driver.memory", args.driver_memory)
-        else:
-            master = f"local[{args.local_cores}]"
-            b = (builder.master(master)
-                       .config("spark.driver.memory", args.driver_memory)
-                       .config("spark.executor.memory", args.executor_memory))
-        spark = b.getOrCreate()
+        spark = builder.getOrCreate()
     except Exception as e:
         if args.mode == "local-cluster":
-            # Fallback to local[...] if this Spark build doesn't support local-cluster
-            print(f"[warn] Failed to use master local-cluster: {e}")
+            # Fall back to single-JVM local mode
+            print(f"[warn] Failed to start master {master}: {e}")
             print("[warn] Falling back to single-JVM local mode.")
-            master = f"local[{args.local_cores}]"
-            spark = (builder.master(master)
-                            .config("spark.driver.memory", args.driver_memory)
-                            .config("spark.executor.memory", args.executor_memory)
-                            .getOrCreate())
+            master_fallback = f"local[{args.local_cores}]"
+            builder2 = (base.master(master_fallback)
+                             .config("spark.driver.memory", args.driver_memory)
+                             .config("spark.executor.memory", args.executor_memory))
+            spark = builder2.getOrCreate()
         else:
             raise
-    spark.sparkContext.setLogLevel("WARN")
 
-    # Auto-tune reduces: keep total shuffle blocks under target
+    print(f"[spark] master = {spark.sparkContext.master}")
+
+    # Auto-tune reduce partitions: keep (#splits × #reduces) under target
     try:
         splits = estimate_input_splits_localfs(args.input, args.max_partition_bytes)
         target = max(10_000_000, int(args.target_shuffle_blocks))
@@ -318,14 +264,13 @@ def _build_spark_with_master(builder, args, mem_mb: Optional[int] = None) -> Spa
         spark.conf.set("spark.sql.shuffle.partitions", str(reduces))
         print(f"[auto-shuffle] input_splits≈{splits}, targetBlocks={target} -> shuffle.partitions={reduces}")
     except Exception as e:
-        print(f"[auto-shuffle] Could not estimate input splits ({e}); using Spark default value.")
+        print(f"[auto-shuffle] Could not estimate input splits ({e}); using Spark default.")
 
+    spark.sparkContext.setLogLevel("WARN")
     return spark
 
 
-# -----------------------
-# Data I/O
-# -----------------------
+# ----------------------- Data I/O -----------------------
 
 def read_raw_dataset(spark: SparkSession, args: argparse.Namespace) -> DataFrame:
     if args.limit_files is not None and args.limit_files > 0:
@@ -338,7 +283,7 @@ def read_raw_dataset(spark: SparkSession, args: argparse.Namespace) -> DataFrame
 
     cols = df.columns
     if "min_hash" not in cols or "sample_id" not in cols:
-        raise RuntimeError("Input parquet must contain columns: min_hash (int64), sample_id (string).")
+        raise RuntimeError("Input parquet must contain: min_hash (int64), sample_id (string).")
 
     extra = [F.col("ksize")] if "ksize" in cols else []
     df = df.select(
@@ -360,12 +305,9 @@ def read_raw_dataset(spark: SparkSession, args: argparse.Namespace) -> DataFrame
     return df
 
 
-# -----------------------
-# Stages
-# -----------------------
+# ----------------------- Stages -----------------------
 
-COUNTS_PARTS = 8192  # bucket partitions for counts output
-
+COUNTS_PARTS = 8192  # partition count for counts output (by bucket)
 
 def stage_counts(spark: SparkSession, args: argparse.Namespace, df_raw: DataFrame) -> None:
     out_counts = os.path.join(args.out, "counts_parquet")
@@ -377,7 +319,8 @@ def stage_counts(spark: SparkSession, args: argparse.Namespace, df_raw: DataFram
         .groupBy("min_hash")
         .agg(F.count(F.lit(1)).alias("n_samples"))
         .withColumn("bucket", F.pmod(F.col("min_hash"), F.lit(COUNTS_PARTS)).cast(T.IntegerType()))
-    ).repartition(COUNTS_PARTS, "bucket")
+        .repartition(COUNTS_PARTS, "bucket")
+    )
 
     counts_df.write.mode("overwrite").partitionBy("bucket").parquet(out_counts)
     print(f"[counts] wrote: {out_counts}")
@@ -386,7 +329,7 @@ def stage_counts(spark: SparkSession, args: argparse.Namespace, df_raw: DataFram
 def read_counts(spark: SparkSession, args: argparse.Namespace) -> DataFrame:
     path = os.path.join(args.out, "counts_parquet")
     if not (path.startswith("hdfs://") or path.startswith("s3://")) and not os.path.exists(path):
-        raise RuntimeError(f"Counts parquet not found at {path}. Run 'counts' stage first.")
+        raise RuntimeError(f"Counts parquet not found at {path}. Run 'counts' first.")
     return spark.read.parquet(path).select("min_hash", "n_samples")
 
 
@@ -430,7 +373,7 @@ def stage_ids(spark: SparkSession, args: argparse.Namespace, df_raw: DataFrame, 
 
     topn_keys = topn_df.select("min_hash")
 
-    # Broadcast only if topN is modest; otherwise disable auto-broadcast
+    # Broadcast only for modest topN; else disable to conserve driver memory
     if args.topN <= 5_000_000:
         join_keys = F.broadcast(topn_keys)
     else:
@@ -471,14 +414,11 @@ def stage_ids(spark: SparkSession, args: argparse.Namespace, df_raw: DataFrame, 
         print(f"[ids] wrote json: {f}")
 
 
-# -----------------------
-# Main
-# -----------------------
+# ----------------------- Main -----------------------
 
 def main() -> int:
     args = parse_args()
 
-    # Prepare output root
     if not (args.out.startswith("hdfs://") or args.out.startswith("s3://")):
         os.makedirs(args.out, exist_ok=True)
 
