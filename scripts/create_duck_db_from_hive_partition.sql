@@ -1,5 +1,5 @@
 PRAGMA threads=64;
-PRAGMA memory_limit='3500GB';
+PRAGMA memory_limit='3000GB';
 
 CREATE SCHEMA IF NOT EXISTS sigs_dna;
 
