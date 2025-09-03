@@ -1,0 +1,13 @@
+PRAGMA threads=64;
+PRAGMA memory_limit='3500GB';
+
+CREATE SCHEMA IF NOT EXISTS sigs_dna;
+
+CREATE TABLE sigs_dna.unique_hash_k31 AS
+SELECT hash::BIGINT AS hash
+FROM read_parquet('/scratch/shared_data_new/Logan_yacht_data/processed_data/unique_hashes/minhash31_db1/bucket=*/*.parquet')
+ORDER BY hash;
+
+CHECKPOINT;
+ANALYZE sigs_dna.unique_hash_k31;
+
