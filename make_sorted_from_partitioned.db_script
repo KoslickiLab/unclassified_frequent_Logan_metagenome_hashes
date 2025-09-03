@@ -1,0 +1,7 @@
+# DuckDB command to ingest the hive partitioned Logan metagenome hashes (no duplicates) in `minhash_31_db1`, sort them, and then save to one big parquet file
+
+COPY (
+  SELECT min_hash
+  FROM read_parquet('/scratch/shared_data_new/Logan_yacht_data/processed_data/unique_hashes/minhash31_db1/bucket=*/*.parquet')
+  ORDER BY min_hash
+) TO '/scratch/dmk333_new/unclassified_frequent_Logan_metagenome_hashes/data/Logan_metagenomes_unique_minhash_k31_sorted.parquet' (FORMAT 'parquet', COMPRESSION 'zstd');
