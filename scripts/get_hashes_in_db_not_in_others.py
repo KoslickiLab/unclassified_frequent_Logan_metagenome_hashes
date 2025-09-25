@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
 """
-get_hashes_in_db_not_in_others_v4.py
+get_hashes_in_db_not_in_others_v6.py
 
-- FIX: define pragmas_sql correctly (no self-reference), then prepend attach_sql in each block.
-- Re-attach all source DBs in EVERY DuckDB invocation (new CLI process each time).
-- Robust 3-part qualification alias.schema.table (defaults schema='main' if not provided).
-- One-time build of right-side union (k=31 when available) into work.neg_bkt with DISTINCT.
-- Preflight schema/column checks (LIMIT 0) before heavy work.
-- Resets work.out per run.
-- Progress: DuckDB native progress bar (in TTY) + per-bucket ETA.
+Improvements vs v5:
+- Avoids "Directory is not empty" on export by:
+  * writing debug SQL to a separate --log-dir (default <out-dir>/_logs),
+  * exporting PARTITIONED Parquet into a timestamped run subdirectory (<out-dir>/<base_name>) by default.
+- Adds --overwrite-output flag to pass COPY(... OVERWRITE TRUE) for single-file and directory exports.
+- Keeps portable anti-join (LEFT JOIN ... WHERE n.hash IS NULL), re-attach per call, robust 3-part qualification,
+  preflight checks, one-time build of right union (k=31 when available), bucketed execution, and deterministic sampling.
 
 Usage example:
-  python get_hashes_in_db_not_in_others_v4.py \
+  python get_hashes_in_db_not_in_others_v6.py \
     --manifest /path/DB_info.json \
     --work-db /path/work.db \
     --tmp-dir /fast/tmp \
     --threads 128 --memory 3000GB --buckets 256 \
-    --out-dir /path/out_dir
+    --out-dir /path/out_dir \
+    --overwrite-output \
+    --sample-fraction 0.001
 """
 
-import argparse, json, os, subprocess, sys, time
+import argparse, json, math, os, subprocess, sys, time
 from pathlib import Path
 from typing import Dict, Any, List
 
@@ -73,6 +75,19 @@ def pretty_seconds(sec: float) -> str:
     if m < 60: return f"{m:.1f}m"
     h = m / 60.0
     return f"{h:.2f}h"
+
+def compute_sampling_bits(fraction: float) -> (int, int):
+    if not (0 < fraction <= 1.0):
+        raise ValueError("--sample-fraction must be in (0, 1].")
+    if fraction >= 1.0:
+        return (0, 0)
+    for bits in range(1, 31):
+        denom = 1 << bits
+        thr = int(round(fraction * denom))
+        if thr <= 0: thr = 1
+        if thr < denom:
+            return (bits, thr)
+    return (30, (1 << 30) - 1)
 
 # --------------------------- validation ---------------------------
 
@@ -130,10 +145,13 @@ def main():
     ap.add_argument("--threads", type=int, default=128, help="DuckDB PRAGMA threads")
     ap.add_argument("--memory", default="3500GB", help="DuckDB memory_limit, e.g. 3500GB")
     ap.add_argument("--buckets", type=int, default=256, help="Power-of-two number of buckets (e.g., 256)")
-    ap.add_argument("--out-dir", default="out_parquet", help="Directory to write Parquet")
+    ap.add_argument("--out-dir", default="out_parquet", help="Directory to write Parquet (parent directory)")
     ap.add_argument("--single-file", action="store_true", help="Write one Parquet file instead of partitioned by bucket")
+    ap.add_argument("--overwrite-output", action="store_true", help="Pass COPY(... OVERWRITE TRUE) to DuckDB")
     ap.add_argument("--distinct-left", action="store_true", help="DISTINCT per-bucket on left (if left may have dupes)")
     ap.add_argument("--skip-build-neg", action="store_true", help="Reuse existing work.neg_bkt (do not rebuild)")
+    ap.add_argument("--sample-fraction", type=float, default=1.0, help="Deterministic fraction (0<f<=1). Uses higher bits to avoid correlation with bucket.")
+    ap.add_argument("--log-dir", default=None, help="Directory for debug SQL logs (defaults to <out-dir>/_logs)")
     args = ap.parse_args()
 
     manifest_path = Path(args.manifest)
@@ -148,9 +166,13 @@ def main():
         print("--threads must be positive.", file=sys.stderr); sys.exit(2)
     if not is_power_of_two(args.buckets) or args.buckets > 65536:
         print("--buckets must be a power of two (<= 65536).", file=sys.stderr); sys.exit(2)
+    if not (0 < args.sample_fraction <= 1.0):
+        print("--sample-fraction must be in (0, 1].", file=sys.stderr); sys.exit(2)
 
     tmp_dir.mkdir(parents=True, exist_ok=True)
     out_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = Path(args.log_dir) if args.log_dir else (out_dir / "_logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
 
     manifest = load_and_validate_manifest(manifest_path)
     dbs: List[Dict[str,Any]] = manifest["databases"]
@@ -169,12 +191,26 @@ PRAGMA progress_bar_time=1000;
     attach_sql = ";\n".join(f"ATTACH {q_str(d['path'])} AS {d['alias']} (READ_ONLY)" for d in dbs) + ";"
 
     mask = args.buckets - 1
+    bucket_bits = int(math.log2(args.buckets))
+
+    # Sampling predicate; use higher bits to avoid correlation with bucket lower bits
+    def sampling_clause(col_ident: str) -> str:
+        if args.sample_fraction >= 1.0: return ""
+        sample_bits, sample_thr = compute_sampling_bits(args.sample_fraction)
+        return f"(({col_ident} >> {bucket_bits}) & {(1<<sample_bits)-1}) < {sample_thr}"
+
     left_tbl = qualify3(left_db["alias"], left_db["table"])
     left_col = icol(left_db["column"])
 
     stamp = time.strftime("%Y%m%d_%H%M%S")
     base_name = f"{left_db['alias']}_minus_rights_k31_{stamp}"
-    single_path = out_dir / f"{base_name}.parquet"
+    # Export destinations
+    if args.single_file:
+        export_dir = out_dir  # parent dir can contain logs
+        single_path = export_dir / f"{base_name}.parquet"
+    else:
+        export_dir = out_dir / base_name  # unique run subdir to avoid "not empty"
+        single_path = None
 
     env = os.environ.copy()
 
@@ -189,7 +225,7 @@ CREATE OR REPLACE TABLE work.out (hash BIGINT, bucket INTEGER);
 CHECKPOINT;
 """
     print("Initializing DuckDB and attaching databases...")
-    run_duckdb_sql(work_db, init_sql, env, out_dir / "debug_init.sql", "init")
+    run_duckdb_sql(work_db, init_sql, env, log_dir / "debug_init.sql", "init")
 
     # Preflight: validate tables/columns exist
     preflight_parts = [f"SELECT {left_col} FROM {left_tbl} LIMIT 0"]
@@ -204,7 +240,7 @@ CHECKPOINT;
     preflight_sql = ";\n".join(preflight_parts) + ";"
 
     run_duckdb_sql(work_db, "PRAGMA enable_progress_bar=false;\n" + attach_sql + "\n" + preflight_sql,
-                   env, out_dir / "debug_preflight.sql", "preflight")
+                   env, log_dir / "debug_preflight.sql", "preflight")
     print("Preflight schema/column checks passed.")
 
     # Phase 1: Build RIGHT union once (unless skipping)
@@ -216,12 +252,15 @@ CHECKPOINT;
         for r in right_dbs:
             tbl = qualify3(r["alias"], r["table"])
             col = icol(r["column"])
-            where = []
+            where_clauses = []
             kcol = r.get("ksize")
             if isinstance(kcol, str) and kcol.strip():
                 kcol_ident = icol(kcol)
-                where.append(f"{kcol_ident} = 31")
-            where_clause = (" WHERE " + " AND ".join(where)) if where else ""
+                where_clauses.append(f"{kcol_ident} = 31")
+            samp = sampling_clause(col)
+            if samp:
+                where_clauses.append(samp)
+            where_clause = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
             union_parts.append(f"SELECT {col} AS hash FROM {tbl}{where_clause}")
 
         union_sql = "\n  UNION ALL\n  ".join(union_parts)
@@ -242,17 +281,22 @@ ORDER BY bucket, hash;
 CHECKPOINT;
 ANALYZE work.neg_bkt;
 """
-        run_duckdb_sql(work_db, build_neg_sql, env, out_dir / "debug_build_neg.sql", "build_neg")
+        run_duckdb_sql(work_db, build_neg_sql, env, log_dir / "debug_build_neg.sql", "build_neg")
         print(f"Right union built in {pretty_seconds(time.time() - t0)}")
     else:
         print("Skipping build of work.neg_bkt (as requested).")
 
-    # Phase 2: Bucketed anti-joins
-    print("Running bucketed LEFT ANTI JOIN (left minus rights)...")
+    # Phase 2: Bucketed anti-joins (portable LEFT JOIN IS NULL)
+    print("Running bucketed LEFT JOIN ... IS NULL (left minus rights)...")
     t0 = time.time()
     for b in range(args.buckets):
         t_bucket = time.time()
-        left_select = f"SELECT {'DISTINCT ' if args.distinct_left else ''}{left_col} AS hash FROM {left_tbl} WHERE (({left_col} & {mask}) = {b})"
+        where_terms = [f"(({left_col} & {mask}) = {b})"]
+        samp_left = sampling_clause(left_col)
+        if samp_left:
+            where_terms.append(samp_left)
+        left_select = f"SELECT {'DISTINCT ' if args.distinct_left else ''}{left_col} AS hash FROM {left_tbl} WHERE " + " AND ".join(where_terms)
+
         sql = f"""
 {pragmas_sql}
 {attach_sql}
@@ -261,14 +305,15 @@ ANALYZE work.neg_bkt;
 INSERT INTO work.out
 SELECT a.hash, {b} AS bucket
 FROM ({left_select}) a
-LEFT ANTI JOIN (
+LEFT JOIN (
   SELECT hash FROM work.neg_bkt WHERE bucket = {b}
-) n USING (hash);
+) n ON a.hash = n.hash
+WHERE n.hash IS NULL;
 
 CHECKPOINT;
 """
         print(f"[{b:03d}/{args.buckets-1}] Processing bucket {b} ...", flush=True)
-        run_duckdb_sql(work_db, sql, env, out_dir / f"debug_bucket_{b:03d}.sql", f"bucket_{b}")
+        run_duckdb_sql(work_db, sql, env, log_dir / f"debug_bucket_{b:03d}.sql", f"bucket_{b}")
         dt = time.time() - t_bucket
         done = b + 1
         eta = (time.time() - t0) / done * (args.buckets - done)
@@ -279,6 +324,7 @@ CHECKPOINT;
     # Phase 3: Export
     print("Exporting results to Parquet ...")
     if args.single_file:
+        overwrite_opt = ", OVERWRITE TRUE" if args.overwrite_output else ""
         export_sql = f"""
 PRAGMA threads={args.threads};
 PRAGMA temp_directory={q_str(str(tmp_dir))};
@@ -286,13 +332,16 @@ PRAGMA enable_progress_bar=true;
 PRAGMA progress_bar_time=1000;
 
 COPY (SELECT hash FROM work.out ORDER BY hash)
-TO {q_str(str(single_path))} (FORMAT PARQUET);
+TO {q_str(str(single_path))} (FORMAT PARQUET{overwrite_opt});
 
 CHECKPOINT;
 """
-        run_duckdb_sql(work_db, export_sql, env, out_dir / "debug_export.sql", "export_single")
+        run_duckdb_sql(work_db, export_sql, env, log_dir / "debug_export.sql", "export_single")
         print(f"Parquet written: {single_path}")
     else:
+        # Unique run subdir; create parent but not the subdir (DuckDB will create it).
+        export_dir.parent.mkdir(parents=True, exist_ok=True)
+        overwrite_opt = ", OVERWRITE TRUE" if args.overwrite_output else ""
         export_sql = f"""
 PRAGMA threads={args.threads};
 PRAGMA temp_directory={q_str(str(tmp_dir))};
@@ -300,14 +349,15 @@ PRAGMA enable_progress_bar=true;
 PRAGMA progress_bar_time=1000;
 
 COPY (SELECT hash, bucket FROM work.out)
-TO {q_str(str(out_dir))} (FORMAT PARQUET, PARTITION_BY (bucket));
+TO {q_str(str(export_dir))} (FORMAT PARQUET, PARTITION_BY (bucket){overwrite_opt});
 
 CHECKPOINT;
 """
-        run_duckdb_sql(work_db, export_sql, env, out_dir / "debug_export.sql", "export_partitioned")
-        print(f"Parquet partitioned by bucket in directory: {out_dir}")
+        run_duckdb_sql(work_db, export_sql, env, log_dir / "debug_export.sql", "export_partitioned")
+        print(f"Parquet partitioned by bucket in directory: {export_dir}")
 
     print("Done.")
 
 if __name__ == "__main__":
     main()
+
