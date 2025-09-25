@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """
-get_hashes_in_db_not_in_others_v3.py
+get_hashes_in_db_not_in_others_v4.py
 
-Key fixes over v2:
-- Use robust 3-part qualification: database.schema.table (defaults schema='main' if none supplied).
-- Reset work.out each run (CREATE OR REPLACE TABLE) to avoid accidental appends.
-- Build the right-side UNION once into work.neg_bkt (bucketed by mask) with DISTINCT across all rights.
-- Solid validation & error handling with per-phase SQL dumps for debugging.
-- Native DuckDB progress bar visible in a TTY (enable_progress_bar).
+- FIX: define pragmas_sql correctly (no self-reference), then prepend attach_sql in each block.
+- Re-attach all source DBs in EVERY DuckDB invocation (new CLI process each time).
+- Robust 3-part qualification alias.schema.table (defaults schema='main' if not provided).
+- One-time build of right-side union (k=31 when available) into work.neg_bkt with DISTINCT.
+- Preflight schema/column checks (LIMIT 0) before heavy work.
+- Resets work.out per run.
+- Progress: DuckDB native progress bar (in TTY) + per-bucket ETA.
 
-This program reads a manifest JSON with database entries that have fields:
-  alias, path, table, column, set_id, [ksize]
-and computes:  LEFT (set_id='left')  MINUS  UNION(RIGHTS with ksize=31 when present).
+Usage example:
+  python get_hashes_in_db_not_in_others_v4.py \
+    --manifest /path/DB_info.json \
+    --work-db /path/work.db \
+    --tmp-dir /fast/tmp \
+    --threads 128 --memory 3000GB --buckets 256 \
+    --out-dir /path/out_dir
 """
 
 import argparse, json, os, subprocess, sys, time
@@ -31,22 +36,14 @@ def q_str(s: str) -> str:
     return "'" + s.replace("'", "''") + "'"
 
 def q_ident(s: str) -> str:
-    # quote identifier if needed
     return s if ident_ok(s) else '"' + s.replace('"', '""') + '"'
 
 def qualify3(alias: str, table: str) -> str:
-    """
-    Build a 3-part reference: alias.schema.table
-    - If table contains no dot -> alias.main.table
-    - If table contains one dot -> alias.<schema>.<table>
-    - If table contains >=2 dots -> alias.<second_last>.<last> (warn in comments)
-    """
     parts = table.split('.')
     if len(parts) == 1:
         schema, tbl = 'main', parts[0]
     else:
         schema, tbl = parts[-2], parts[-1]
-    # Always return 3-part, with safe identifiers for schema/table
     return f"{alias}.{q_ident(schema)}.{q_ident(tbl)}"
 
 def icol(name: str) -> str:
@@ -160,12 +157,16 @@ def main():
     left_db = next(d for d in dbs if d["set_id"] == "left")
     right_dbs = [d for d in dbs if d["set_id"] == "right"]
 
-    # Build reusable SQL snippets
-    attach_sql = ";\n".join(f"ATTACH {q_str(d['path'])} AS {d['alias']} (READ_ONLY)" for d in dbs) + ";"
+    # Reusable snippets: PRAGMAs and ATTACHes
     pragmas_sql = f"""
-{pragmas_sql}
-{attach_sql}
+PRAGMA threads={args.threads};
+PRAGMA memory_limit={q_str(args.memory)};
+PRAGMA temp_directory={q_str(str(tmp_dir))};
+PRAGMA enable_progress_bar=true;
+PRAGMA progress_bar_time=1000;
 """.strip()
+
+    attach_sql = ";\n".join(f"ATTACH {q_str(d['path'])} AS {d['alias']} (READ_ONLY)" for d in dbs) + ";"
 
     mask = args.buckets - 1
     left_tbl = qualify3(left_db["alias"], left_db["table"])
@@ -177,14 +178,12 @@ def main():
 
     env = os.environ.copy()
 
-    # Phase 0: Init & attach, and reset output table
+    # Phase 0: Init & reset output table
     init_sql = f"""
 {pragmas_sql}
 {attach_sql}
 
 CREATE SCHEMA IF NOT EXISTS work;
-
--- reset output table explicitly
 CREATE OR REPLACE TABLE work.out (hash BIGINT, bucket INTEGER);
 
 CHECKPOINT;
@@ -192,11 +191,8 @@ CHECKPOINT;
     print("Initializing DuckDB and attaching databases...")
     run_duckdb_sql(work_db, init_sql, env, out_dir / "debug_init.sql", "init")
 
-    # Preflight: validate that referenced tables & columns exist (fast, LIMIT 0)
-    preflight_parts = []
-    # left table check
-    preflight_parts.append(f"SELECT {left_col} FROM {left_tbl} LIMIT 0")
-    # rights table checks
+    # Preflight: validate tables/columns exist
+    preflight_parts = [f"SELECT {left_col} FROM {left_tbl} LIMIT 0"]
     for r in right_dbs:
         tbl_q = qualify3(r["alias"], r["table"])
         col_q = icol(r["column"])
@@ -204,15 +200,12 @@ CHECKPOINT;
         kcol = r.get("ksize")
         if isinstance(kcol, str) and kcol.strip():
             kcol_q = icol(kcol)
-            # ensure ksize column exists without scanning rows
             preflight_parts.append(f"SELECT {kcol_q} FROM {tbl_q} LIMIT 0")
     preflight_sql = ";\n".join(preflight_parts) + ";"
-    try:
-        run_duckdb_sql(work_db, f"PRAGMA enable_progress_bar=false;\n" + attach_sql + "\n" + preflight_sql, env, out_dir / "debug_preflight.sql", "preflight")
-        print("Preflight schema/column checks passed.")
-    except Exception:
-        print("Preflight failed. See debug_preflight.sql for the exact statements.", file=sys.stderr)
-        raise
+
+    run_duckdb_sql(work_db, "PRAGMA enable_progress_bar=false;\n" + attach_sql + "\n" + preflight_sql,
+                   env, out_dir / "debug_preflight.sql", "preflight")
+    print("Preflight schema/column checks passed.")
 
     # Phase 1: Build RIGHT union once (unless skipping)
     if not args.skip_build_neg:
@@ -231,17 +224,12 @@ CHECKPOINT;
             where_clause = (" WHERE " + " AND ".join(where)) if where else ""
             union_parts.append(f"SELECT {col} AS hash FROM {tbl}{where_clause}")
 
-        if not union_parts:
-            print("No right-side databases found in manifest.", file=sys.stderr)
-            sys.exit(2)
-
         union_sql = "\n  UNION ALL\n  ".join(union_parts)
 
         build_neg_sql = f"""
 {pragmas_sql}
 {attach_sql}
 
--- Create a bucketed, deduplicated RIGHT set once.
 CREATE OR REPLACE TABLE work.neg_bkt AS
 SELECT DISTINCT
   hash::BIGINT AS hash,
