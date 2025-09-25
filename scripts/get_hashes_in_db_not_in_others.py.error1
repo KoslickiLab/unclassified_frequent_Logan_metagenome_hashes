@@ -1,56 +1,40 @@
 #!/usr/bin/env python3
 """
-get_hashes_in_db_not_in_others_v3.py
+logan_anti_from_manifest_v2.py
 
-Key fixes over v2:
-- Use robust 3-part qualification: database.schema.table (defaults schema='main' if none supplied).
-- Reset work.out each run (CREATE OR REPLACE TABLE) to avoid accidental appends.
-- Build the right-side UNION once into work.neg_bkt (bucketed by mask) with DISTINCT across all rights.
-- Solid validation & error handling with per-phase SQL dumps for debugging.
-- Native DuckDB progress bar visible in a TTY (enable_progress_bar).
-
-This program reads a manifest JSON with database entries that have fields:
-  alias, path, table, column, set_id, [ksize]
-and computes:  LEFT (set_id='left')  MINUS  UNION(RIGHTS with ksize=31 when present).
+- Builds the RIGHT-side union ONCE (with k=31 when k column exists), storing it as a bucketed table.
+- Performs a bucketed LEFT ANTI JOIN per bucket against that prebuilt table.
+- Adds robust manifest/arg validation, path checks, and subprocess error handling.
+- Shows progress: per-phase messages + DuckDB's native progress bar in the terminal.
 """
 
-import argparse, json, os, subprocess, sys, time
+import argparse, json, os, shutil, subprocess, sys, time
 from pathlib import Path
 from typing import Dict, Any, List
 
-# --------------------------- helpers ---------------------------
+# --------------------------- utility helpers ---------------------------
 
 def is_power_of_two(n: int) -> bool:
     return n > 0 and (n & (n - 1)) == 0
 
 def ident_ok(s: str) -> bool:
-    import re
-    return bool(re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', s))
+    # conservative check for bare identifiers
+    return bool(__import__('re').match(r'^[A-Za-z_][A-Za-z0-9_]*$', s))
 
 def q_str(s: str) -> str:
+    # single-quote for SQL string literals
     return "'" + s.replace("'", "''") + "'"
 
-def q_ident(s: str) -> str:
-    # quote identifier if needed
-    return s if ident_ok(s) else '"' + s.replace('"', '""') + '"'
-
-def qualify3(alias: str, table: str) -> str:
-    """
-    Build a 3-part reference: alias.schema.table
-    - If table contains no dot -> alias.main.table
-    - If table contains one dot -> alias.<schema>.<table>
-    - If table contains >=2 dots -> alias.<second_last>.<last> (warn in comments)
-    """
-    parts = table.split('.')
-    if len(parts) == 1:
-        schema, tbl = 'main', parts[0]
-    else:
-        schema, tbl = parts[-2], parts[-1]
-    # Always return 3-part, with safe identifiers for schema/table
-    return f"{alias}.{q_ident(schema)}.{q_ident(tbl)}"
+def qualify(alias: str, table: str) -> str:
+    # Produces 'alias.table' or 'alias.schema.table' if table is schema-qualified
+    # Do not quote identifiers to preserve schema qualification; assume sane names.
+    return f"{alias}.{table}"
 
 def icol(name: str) -> str:
-    return name if ident_ok(name) else '"' + name.replace('"','""') + '"'
+    # Column identifier; quote only if necessary
+    if ident_ok(name):
+        return name
+    return '"' + name.replace('"','""') + '"'
 
 def duckdb_cli_available() -> bool:
     try:
@@ -60,20 +44,26 @@ def duckdb_cli_available() -> bool:
         return False
 
 def run_duckdb_sql(dbfile: Path, sql: str, env: Dict[str, str], debug_sql_path: Path, phase: str):
+    """
+    Run a SQL text in DuckDB CLI so the native progress bar is visible.
+    On failure, dumps SQL to debug_sql_path and raises.
+    """
     try:
         subprocess.run(["duckdb", str(dbfile)], input=sql, text=True, check=True, env=env)
-    except subprocess.CalledProcessError:
+    except subprocess.CalledProcessError as e:
         try:
             debug_sql_path.write_text(sql)
         except Exception:
             pass
-        print(f"\nERROR during phase '{phase}'. SQL dumped to: {debug_sql_path}\n", file=sys.stderr)
+        print(f"\nERROR while executing phase '{phase}'. SQL dumped to: {debug_sql_path}\n", file=sys.stderr)
         raise
 
 def pretty_seconds(sec: float) -> str:
-    if sec < 60: return f"{sec:.1f}s"
+    if sec < 60:
+        return f"{sec:.1f}s"
     m = sec / 60.0
-    if m < 60: return f"{m:.1f}m"
+    if m < 60:
+        return f"{m:.1f}m"
     h = m / 60.0
     return f"{h:.2f}h"
 
@@ -113,6 +103,7 @@ def load_and_validate_manifest(path: Path) -> Dict[str, Any]:
         aliases.add(db["alias"])
         if db["set_id"] == "left":
             left_count += 1
+        # path exists?
         if not Path(db["path"]).exists():
             print(f"Manifest error: database[{i}] path does not exist: {db['path']}", file=sys.stderr)
             sys.exit(2)
@@ -123,20 +114,20 @@ def load_and_validate_manifest(path: Path) -> Dict[str, Any]:
 
     return manifest
 
-# --------------------------- main ---------------------------
+# --------------------------- core script ---------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="Logan hashes: LEFT minus RIGHTS (k=31 when available), bucketed in DuckDB.")
+    ap = argparse.ArgumentParser(description="Bucketed anti-join using a manifest. Builds right-side union once (k=31 when available).")
     ap.add_argument("--manifest", required=True, help="Path to DB_info.json")
     ap.add_argument("--work-db", required=True, help="Path to working DuckDB database file")
     ap.add_argument("--tmp-dir", required=True, help="Temp spill directory (fast SSD)")
     ap.add_argument("--threads", type=int, default=128, help="DuckDB PRAGMA threads")
-    ap.add_argument("--memory", default="3500GB", help="DuckDB memory_limit, e.g. 3500GB")
-    ap.add_argument("--buckets", type=int, default=256, help="Power-of-two number of buckets (e.g., 256)")
+    ap.add_argument("--memory", default="3500GB", help="DuckDB memory_limit (e.g., 3500GB)")
+    ap.add_argument("--buckets", type=int, default=256, help="Number of buckets (power of two, e.g., 64/128/256/512/1024)")
     ap.add_argument("--out-dir", default="out_parquet", help="Directory to write Parquet")
     ap.add_argument("--single-file", action="store_true", help="Write one Parquet file instead of partitioned by bucket")
-    ap.add_argument("--distinct-left", action="store_true", help="DISTINCT per-bucket on left (if left may have dupes)")
-    ap.add_argument("--skip-build-neg", action="store_true", help="Reuse existing work.neg_bkt (do not rebuild)")
+    ap.add_argument("--distinct-left", action="store_true", help="Use DISTINCT on the left per-bucket (if left may have dupes)")
+    ap.add_argument("--skip-build-neg", action="store_true", help="Skip rebuilding work.neg_bkt (must already exist)")
     args = ap.parse_args()
 
     manifest_path = Path(args.manifest)
@@ -144,13 +135,17 @@ def main():
     tmp_dir = Path(args.tmp_dir)
     out_dir = Path(args.out_dir)
 
+    # Basic environment checks
     if not duckdb_cli_available():
-        print("DuckDB CLI ('duckdb') not found in PATH.", file=sys.stderr)
+        print("DuckDB CLI ('duckdb') not found in PATH. Please install or add to PATH.", file=sys.stderr)
         sys.exit(2)
+
     if args.threads <= 0:
-        print("--threads must be positive.", file=sys.stderr); sys.exit(2)
+        print("--threads must be positive.", file=sys.stderr)
+        sys.exit(2)
     if not is_power_of_two(args.buckets) or args.buckets > 65536:
-        print("--buckets must be a power of two (<= 65536).", file=sys.stderr); sys.exit(2)
+        print("--buckets must be a power of two (<= 65536).", file=sys.stderr)
+        sys.exit(2)
 
     tmp_dir.mkdir(parents=True, exist_ok=True)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -160,68 +155,48 @@ def main():
     left_db = next(d for d in dbs if d["set_id"] == "left")
     right_dbs = [d for d in dbs if d["set_id"] == "right"]
 
-    # Build reusable SQL snippets
-    attach_sql = ";\n".join(f"ATTACH {q_str(d['path'])} AS {d['alias']} (READ_ONLY)" for d in dbs) + ";"
-    pragmas_sql = f"""
-{pragmas_sql}
-{attach_sql}
-""".strip()
-
+    # Build common strings
     mask = args.buckets - 1
-    left_tbl = qualify3(left_db["alias"], left_db["table"])
+    left_tbl = qualify(left_db["alias"], left_db["table"])
     left_col = icol(left_db["column"])
 
+    # Output naming
+    right_aliases = "-".join([d["alias"] for d in right_dbs]) or "none"
     stamp = time.strftime("%Y%m%d_%H%M%S")
     base_name = f"{left_db['alias']}_minus_rights_k31_{stamp}"
     single_path = out_dir / f"{base_name}.parquet"
 
+    # Environment for DuckDB (can add env vars here if needed later)
     env = os.environ.copy()
 
-    # Phase 0: Init & attach, and reset output table
+    # ----------------- Phase 0: Attach & PRAGMAs -----------------
     init_sql = f"""
-{pragmas_sql}
-{attach_sql}
+PRAGMA threads={args.threads};
+PRAGMA memory_limit={q_str(args.memory)};
+PRAGMA temp_directory={q_str(str(tmp_dir))};
+PRAGMA enable_progress_bar=true;
+PRAGMA progress_bar_time=1000;
+
+{";".join(f"ATTACH {q_str(d['path'])} AS {d['alias']} (READ_ONLY)" for d in dbs)};
 
 CREATE SCHEMA IF NOT EXISTS work;
 
--- reset output table explicitly
-CREATE OR REPLACE TABLE work.out (hash BIGINT, bucket INTEGER);
+-- Output table (results)
+CREATE TABLE IF NOT EXISTS work.out (hash BIGINT, bucket INTEGER);
 
 CHECKPOINT;
 """
     print("Initializing DuckDB and attaching databases...")
     run_duckdb_sql(work_db, init_sql, env, out_dir / "debug_init.sql", "init")
 
-    # Preflight: validate that referenced tables & columns exist (fast, LIMIT 0)
-    preflight_parts = []
-    # left table check
-    preflight_parts.append(f"SELECT {left_col} FROM {left_tbl} LIMIT 0")
-    # rights table checks
-    for r in right_dbs:
-        tbl_q = qualify3(r["alias"], r["table"])
-        col_q = icol(r["column"])
-        preflight_parts.append(f"SELECT {col_q} FROM {tbl_q} LIMIT 0")
-        kcol = r.get("ksize")
-        if isinstance(kcol, str) and kcol.strip():
-            kcol_q = icol(kcol)
-            # ensure ksize column exists without scanning rows
-            preflight_parts.append(f"SELECT {kcol_q} FROM {tbl_q} LIMIT 0")
-    preflight_sql = ";\n".join(preflight_parts) + ";"
-    try:
-        run_duckdb_sql(work_db, f"PRAGMA enable_progress_bar=false;\n" + attach_sql + "\n" + preflight_sql, env, out_dir / "debug_preflight.sql", "preflight")
-        print("Preflight schema/column checks passed.")
-    except Exception:
-        print("Preflight failed. See debug_preflight.sql for the exact statements.", file=sys.stderr)
-        raise
-
-    # Phase 1: Build RIGHT union once (unless skipping)
+    # ----------------- Phase 1: Build RIGHT union ONCE -----------------
     if not args.skip_build_neg:
         print("Building right-side union (k=31 when available) into work.neg_bkt ...")
         t0 = time.time()
 
         union_parts = []
         for r in right_dbs:
-            tbl = qualify3(r["alias"], r["table"])
+            tbl = qualify(r["alias"], r["table"])
             col = icol(r["column"])
             where = []
             kcol = r.get("ksize")
@@ -229,7 +204,8 @@ CHECKPOINT;
                 kcol_ident = icol(kcol)
                 where.append(f"{kcol_ident} = 31")
             where_clause = (" WHERE " + " AND ".join(where)) if where else ""
-            union_parts.append(f"SELECT {col} AS hash FROM {tbl}{where_clause}")
+            # DISTINCT here to trim per-source duplicates early
+            union_parts.append(f"SELECT DISTINCT {col} AS hash FROM {tbl}{where_clause}")
 
         if not union_parts:
             print("No right-side databases found in manifest.", file=sys.stderr)
@@ -238,10 +214,14 @@ CHECKPOINT;
         union_sql = "\n  UNION ALL\n  ".join(union_parts)
 
         build_neg_sql = f"""
-{pragmas_sql}
-{attach_sql}
+PRAGMA threads={args.threads};
+PRAGMA memory_limit={q_str(args.memory)};
+PRAGMA temp_directory={q_str(str(tmp_dir))};
+PRAGMA enable_progress_bar=true;
+PRAGMA progress_bar_time=1000;
 
 -- Create a bucketed, deduplicated RIGHT set once.
+-- We also order by (bucket, hash) to enable efficient per-bucket scans.
 CREATE OR REPLACE TABLE work.neg_bkt AS
 SELECT DISTINCT
   hash::BIGINT AS hash,
@@ -256,18 +236,22 @@ ANALYZE work.neg_bkt;
 """
         run_duckdb_sql(work_db, build_neg_sql, env, out_dir / "debug_build_neg.sql", "build_neg")
         print(f"Right union built in {pretty_seconds(time.time() - t0)}")
+
     else:
         print("Skipping build of work.neg_bkt (as requested).")
 
-    # Phase 2: Bucketed anti-joins
+    # ----------------- Phase 2: Bucketed anti-joins -----------------
     print("Running bucketed LEFT ANTI JOIN (left minus rights)...")
     t0 = time.time()
     for b in range(args.buckets):
         t_bucket = time.time()
         left_select = f"SELECT {'DISTINCT ' if args.distinct_left else ''}{left_col} AS hash FROM {left_tbl} WHERE (({left_col} & {mask}) = {b})"
         sql = f"""
-{pragmas_sql}
-{attach_sql}
+PRAGMA threads={args.threads};
+PRAGMA memory_limit={q_str(args.memory)};
+PRAGMA temp_directory={q_str(str(tmp_dir))};
+PRAGMA enable_progress_bar=true;
+PRAGMA progress_bar_time=1000;
 
 -- Bucket {b}/{args.buckets-1}
 INSERT INTO work.out
@@ -282,13 +266,14 @@ CHECKPOINT;
         print(f"[{b:03d}/{args.buckets-1}] Processing bucket {b} ...", flush=True)
         run_duckdb_sql(work_db, sql, env, out_dir / f"debug_bucket_{b:03d}.sql", f"bucket_{b}")
         dt = time.time() - t_bucket
+        # simple ETA
         done = b + 1
         eta = (time.time() - t0) / done * (args.buckets - done)
         print(f"[{b:03d}/{args.buckets-1}] Done in {pretty_seconds(dt)} | ETA {pretty_seconds(eta)}", flush=True)
 
     print(f"All buckets completed in {pretty_seconds(time.time() - t0)}")
 
-    # Phase 3: Export
+    # ----------------- Phase 3: Export -----------------
     print("Exporting results to Parquet ...")
     if args.single_file:
         export_sql = f"""
@@ -323,3 +308,4 @@ CHECKPOINT;
 
 if __name__ == "__main__":
     main()
+
