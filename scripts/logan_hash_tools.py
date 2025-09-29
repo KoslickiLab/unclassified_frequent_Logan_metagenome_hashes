@@ -138,11 +138,14 @@ def duckdb_connect(db_path: Optional[Path], read_only: bool, threads: int, memor
 def attach_readonly(con: duckdb.DuckDBPyConnection, db_path: Path, alias: str):
     con.execute(f"ATTACH '{db_path}' AS {alias} (READ_ONLY);")
 
-def parquet_copy(con: duckdb.DuckDBPyConnection, sql: str, out_path: Path, overwrite: bool, row_group_size: int = 100_0000):
+def parquet_copy(con: duckdb.DuckDBPyConnection, sql: str, out_path: Path, overwrite: bool,
+                 row_group_size: int = 100_0000):
     # COPY statement writes query result to parquet
     check_overwrite(out_path, overwrite, "Output file")
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    con.execute(f"COPY ({sql}) TO ? (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {row_group_size});", [str(out_path)])
+    # Use string formatting instead of parameter placeholder
+    copy_sql = f"COPY ({sql}) TO '{str(out_path)}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {row_group_size});"
+    con.execute(copy_sql)
 
 def add_kv_metadata(con: duckdb.DuckDBPyConnection, parquet_path: Path, kv: dict):
     # DuckDB doesn't support editing parquet KV metadata in-place; skip for now.
