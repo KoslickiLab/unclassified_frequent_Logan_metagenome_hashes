@@ -255,7 +255,7 @@ ANALYZE work.target_bkt;
         if samp:
             where_clauses.append(samp)
         where_clause = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
-        union_parts.append(f"SELECT {col} AS hash FROM {tbl}{where_clause}")
+        union_parts.append(f"SELECT {col}::UBIGINT AS hash FROM {tbl}{where_clause}")
 
     union_sql = "\n  UNION ALL\n  ".join(union_parts) if union_parts else "SELECT NULL WHERE FALSE"  # empty guard
 
