@@ -225,6 +225,15 @@ def prepare_hashes(args):
 
     echo("Done: prepare-hashes")
 
+def check_overwrite_dir(path: Path, overwrite: bool, what: str):
+    # Refuse to write into a non-empty existing directory unless --overwrite
+    if path.exists() and any(path.iterdir()):
+        if not overwrite:
+            raise SystemExit(f"{what} already exists and is non-empty: {path}\n"
+                             f"Refusing to overwrite (use --overwrite to allow).")
+
+def sql_quote(s: str) -> str:
+    return s.replace("'", "''")
 
 def compute_counts(args):
     """
@@ -260,7 +269,7 @@ def compute_counts(args):
         con.execute("CREATE TEMPORARY VIEW _pairs AS "
                     f"SELECT DISTINCT s.sample_id, CAST(s.min_hash AS BIGINT) AS min_hash "
                     f"FROM {fq} s JOIN working.hashes h ON h.min_hash = s.min_hash "
-                    f"WHERE s.ksize = ?;", [args.ksize])
+                    f"WHERE s.ksize = {args.ksize};")
 
         # Partition key for manageable file sizes
         con.execute("""
@@ -321,19 +330,24 @@ def percentiles(args):
 
     # Load counts
     if args.counts_path:
-        # External parquet counts
-        con.execute("CREATE OR REPLACE TEMPORARY VIEW _counts AS SELECT * FROM read_parquet(?);", [args.counts_path])
+        counts_path = str(Path(args.counts_path))
     else:
         # Counts previously written into out_dir (hash_counts.parquet / sample_counts.parquet)
-        # Create views if those files exist; else error
-        default_counts = None
         if args.counts_source == "hash":
-            default_counts = Path(args.out_dir) / "hash_counts.parquet"
+            counts_path = str(Path(args.out_dir) / "hash_counts.parquet")
         else:
-            default_counts = Path(args.out_dir) / "sample_counts.parquet"
-        if not default_counts.exists():
-            raise SystemExit(f"Could not find counts parquet at {default_counts}. Use --counts-path to point to it.")
-        con.execute("CREATE OR REPLACE TEMPORARY VIEW _counts AS SELECT * FROM read_parquet(?);", [str(default_counts)])
+            counts_path = str(Path(args.out_dir) / "sample_counts.parquet")
+        if not Path(counts_path).exists():
+            raise SystemExit(f"Could not find counts parquet at {counts_path}. Use --counts-path to point to it.")
+
+    echo(f"Loading counts from: {counts_path}")
+    counts_path_q = sql_quote(counts_path)
+    con.execute(f"CREATE OR REPLACE TEMPORARY VIEW _counts AS SELECT * FROM read_parquet('{counts_path_q}');")
+    try:
+        n_counts = con.execute("SELECT COUNT(*) FROM _counts;").fetchone()[0]
+        echo(f"_counts loaded: {n_counts:,} rows")
+    except Exception as _e:
+        echo(f"WARNING: could not count _counts rows: {_e}")
 
     p_low, p_high = args.percentiles
     if not (0.0 <= p_low <= 1.0 and 0.0 <= p_high <= 1.0 and p_low <= p_high):
@@ -370,10 +384,21 @@ def percentiles(args):
         # Selected hashes
         con.execute(f"""
             CREATE OR REPLACE TEMPORARY VIEW _selected_hashes AS
-            SELECT {key_col} AS min_hash FROM _counts WHERE {count_col} >= ? AND {count_col} <= ?;
-        """, [low_cut, high_cut])
+            SELECT {key_col} AS min_hash
+            FROM _counts
+            WHERE {count_col} >= {low_cut} AND {count_col} <= {high_cut};
+        """)
+        try:
+            n_sel = con.execute("SELECT COUNT(*) FROM _selected_hashes;").fetchone()[0]
+            echo(f"Selected hashes in percentile range: {n_sel:,}")
+        except Exception as _e:
+            echo(f"WARNING: could not count _selected_hashes rows: {_e}")
 
-        ensure_dir(Path(args.map_out))
+        map_dir = Path(args.map_out)
+        check_overwrite_dir(map_dir, args.overwrite, "Map output dir")
+        ensure_dir(map_dir)
+        map_dir_q = sql_quote(str(map_dir))
+        echo(f"Writing partitioned pairs to: {map_dir}")
         # For exactness and to remove intra-sample duplicates, use DISTINCT on pairs
         # Partition by 'part' to many small files
         con.execute(f"""
@@ -383,8 +408,9 @@ def percentiles(args):
               JOIN _selected_hashes sh ON sh.min_hash = s.min_hash
               WHERE s.ksize = {args.ksize}
             )
-            TO ? (FORMAT PARQUET, COMPRESSION ZSTD, PARTITION_BY (part), ROW_GROUP_SIZE 1000000);
-        """, [str(Path(args.map_out))])
+            TO '{map_dir_q}' (FORMAT PARQUET, COMPRESSION ZSTD, PARTITION_BY (part), ROW_GROUP_SIZE 1000000);
+        """)
+        echo("Finished writing hash→sample pairs.")
 
     if args.counts_source == "sample" and args.emit_sample_list:
         echo("Materializing sample_id list in percentile range ...")
@@ -526,7 +552,11 @@ def main(argv=None):
     try:
         args.func(args)
     except Exception as e:
-        echo(f"ERROR: {e}")
+        # Print full traceback for easier debugging (line numbers & stack)
+        import traceback
+        echo(f"ERROR: {type(e).__name__}: {e}")
+        tb = traceback.format_exc()
+        print(tb, file=sys.stderr, flush=True)
         sys.exit(2)
 
 
