@@ -397,20 +397,27 @@ def percentiles(args):
         map_dir = Path(args.map_out)
         check_overwrite_dir(map_dir, args.overwrite, "Map output dir")
         ensure_dir(map_dir)
-        map_dir_q = sql_quote(str(map_dir))
-        echo(f"Writing partitioned pairs to: {map_dir}")
-        # For exactness and to remove intra-sample duplicates, use DISTINCT on pairs
-        # Partition by 'part' to many small files
-        con.execute(f"""
-            COPY (
-              SELECT DISTINCT s.min_hash, s.sample_id, (s.min_hash % 1024) AS part
-              FROM {fq} s
-              JOIN _selected_hashes sh ON sh.min_hash = s.min_hash
-              WHERE s.ksize = {args.ksize}
-            )
-            TO '{map_dir_q}' (FORMAT PARQUET, COMPRESSION ZSTD, PARTITION_BY (part), ROW_GROUP_SIZE 1000000);
-        """)
-        echo("Finished writing hash→sample pairs.")
+        # Controlled sharding: write N big files, one per shard
+        num_shards = int(getattr(args, "pairs_shards", 128))
+        rg_size = int(getattr(args, "pairs_row_group_size", 1_000_000))
+        prefix = getattr(args, "pairs_file_prefix", "pairs_shard_")
+        echo(f"Writing hash→sample pairs with controlled sharding: {num_shards} shards (ROW_GROUP_SIZE={rg_size})")
+        for shard in range(num_shards):
+            shard_path = map_dir / f"{prefix}{shard:04d}.parquet"
+            check_overwrite(shard_path, args.overwrite, "Shard parquet")
+            shard_path_q = sql_quote(str(shard_path))
+            echo(f"  -> shard {shard+1}/{num_shards} (id={shard}) -> {shard_path.name}")
+            # One big file per shard; DISTINCT removes intra-sample dupes
+            con.execute(f"""
+                COPY (
+                  SELECT DISTINCT s.min_hash, s.sample_id
+                  FROM {fq} s
+                  JOIN _selected_hashes sh ON sh.min_hash = s.min_hash
+                  WHERE s.ksize = {args.ksize} AND (s.min_hash % {num_shards}) = {shard}
+                )
+                TO '{shard_path_q}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {rg_size});
+            """)
+        echo("Finished writing hash→sample pairs (sharded).")
 
     if args.counts_source == "sample" and args.emit_sample_list:
         echo("Materializing sample_id list in percentile range ...")
@@ -508,6 +515,11 @@ def main(argv=None):
     p_pct.add_argument("--emit-mapping-for-hashes", action="store_true", help="Emit DISTINCT(min_hash,sample_id) for hashes in percentile range")
     p_pct.add_argument("--map-out", default="", help="Output dir for hash->sample_id pairs parquet (required if --emit-mapping-for-hashes)")
     p_pct.add_argument("--ksize", type=int, default=31, help="K-mer size filter for mapping")
+    # fewer, bigger files: write a fixed number of shards instead of per-thread fragments
+    p_pct.add_argument("--pairs-shards", type=int, default=128,
+                       help="Number of output parquet shards for hash→sample pairs (smaller = fewer, bigger files)")
+    p_pct.add_argument("--pairs-row-group-size", type=int, default=1_000_000,
+                       help="ROW_GROUP_SIZE to use when writing shards")
 
     # attach DB for mapping step
     p_pct.add_argument("--attach-db", default="", help="Path to giant database_all.db (required if --emit-mapping-for-hashes)")
