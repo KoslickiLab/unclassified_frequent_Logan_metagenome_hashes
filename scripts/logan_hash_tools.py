@@ -373,10 +373,6 @@ def percentiles(args):
     except Exception as _e:
         echo(f"WARNING: could not count _counts rows: {_e}")
 
-    p_low, p_high = args.percentiles
-    if not (0.0 <= p_low <= 1.0 and 0.0 <= p_high <= 1.0 and p_low <= p_high):
-        raise SystemExit("--percentiles must be two floats in [0,1], with low <= high.")
-
     # Identify the count column
     if args.counts_source == "hash":
         count_col = "sample_count"
@@ -385,11 +381,31 @@ def percentiles(args):
         count_col = "matched_hash_count"
         key_col = "sample_id"
 
-    # Compute quantiles
-    echo(f"Computing quantiles for {count_col}: p_low={p_low}, p_high={p_high}")
-    row = con.execute(f"SELECT quantile_cont({count_col}, {p_low}), quantile_cont({count_col}, {p_high}) FROM _counts;").fetchone()
-    low_cut, high_cut = row[0], row[1]
-    echo(f"Percentile cutpoints: low={low_cut}, high={high_cut}")
+    # Determine cut mode: percentiles or explicit cuts
+    mode = None
+    p_low = p_high = None
+    if args.percentiles is not None:
+        p_low, p_high = args.percentiles
+        if not (0.0 <= p_low <= 1.0 and 0.0 <= p_high <= 1.0 and p_low <= p_high):
+            raise SystemExit("--percentiles must be two floats in [0,1], with low <= high.")
+        mode = "percentiles"
+        echo(f"Computing quantiles for {count_col}: p_low={p_low}, p_high={p_high}")
+        row = con.execute(
+            f"SELECT quantile_cont({count_col}, {p_low}), quantile_cont({count_col}, {p_high}) FROM _counts;"
+        ).fetchone()
+        low_cut, high_cut = row[0], row[1]
+        echo(f"Percentile cutpoints: low={low_cut}, high={high_cut}")
+    else:
+        mode = "manual_cuts"
+        low_cut = float(args.low_cut)
+        high_cut = float(args.high_cut)
+        echo(f"Using user-specified cutpoints for {count_col}: low_cut={low_cut}, high_cut={high_cut}")
+        # (Optional sanity) Show coverage
+        try:
+            n_sel_preview = con.execute(f"SELECT COUNT(*) FROM _counts WHERE {count_col} >= {low_cut} AND {count_col} <= {high_cut};").fetchone()[0]
+            echo(f"Rows in cut range (preview on counts parquet): {n_sel_preview:,}")
+        except Exception as _e:
+            echo(f"WARNING: could not preview selection size: {_e}")
 
     # Persist cutpoints
     cp_path = Path(args.out_dir) / f"{args.counts_source}_percentiles.json"
@@ -565,7 +581,9 @@ def main(argv=None):
     p_pct.add_argument("--out-dir", required=True, help="Directory where counts parquet live (or where percentiles JSON will be written)")
     p_pct.add_argument("--counts-source", choices=["hash","sample"], required=True, help="Which counts are we analyzing")
     p_pct.add_argument("--counts-path", default="", help="Explicit path to counts parquet; otherwise uses out-dir default")
-    p_pct.add_argument("--percentiles", nargs=2, type=float, required=True, metavar=("LOW","HIGH"), help="Two floats in [0,1]")
+    p_pct.add_argument("--percentiles", nargs=2, type=float, metavar=("LOW","HIGH"), help="Two floats in [0,1] (use instead of --low-cut/--high-cut)")
+    p_pct.add_argument("--low-cut", type=float, default=None, help="Explicit lower cutpoint (inclusive) on the count column")
+    p_pct.add_argument("--high-cut", type=float, default=None, help="Explicit upper cutpoint (inclusive) on the count column")
     p_pct.add_argument("--threads", type=int, default=os.cpu_count() or 64, help="DuckDB threads")
     p_pct.add_argument("--memory-limit", default="3500GB", help="DuckDB memory limit (e.g., '3500GB' or '3.5TB')")
     p_pct.add_argument("--temp-dir", default="/scratch/duck_tmp", help="Directory for DuckDB temp & spills")
@@ -626,6 +644,17 @@ def main(argv=None):
             p.error("--emit-mapping-for-hashes requires --attach-db")
         if args.emit_sample_list and not args.sample_list_out:
             p.error("--emit-sample-list requires --sample-list-out")
+        # XOR validation for cut specification
+        pct_specified = args.percentiles is not None
+        cuts_specified = (args.low_cut is not None) or (args.high_cut is not None)
+        if pct_specified and cuts_specified:
+            p.error("Provide either --percentiles LOW HIGH or --low-cut X --high-cut Y, not both.")
+        if not pct_specified and not cuts_specified:
+            p.error("You must provide either --percentiles LOW HIGH or --low-cut X --high-cut Y.")
+        if cuts_specified and (args.low_cut is None or args.high_cut is None):
+            p.error("Both --low-cut and --high-cut are required when using explicit cutpoints.")
+        if cuts_specified and (args.low_cut > args.high_cut):
+            p.error("--low-cut must be <= --high-cut.")
 
     # Execute
     try:
