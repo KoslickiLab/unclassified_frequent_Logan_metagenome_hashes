@@ -111,30 +111,28 @@ def plot_histogram(hist_counts, bin_edges, save_path='sample_count_histogram.png
     # Add overflow bin if max_value was specified and there are overflow values
     if max_value is not None and overflow_count > 0:
         # Add some spacing and then the overflow bar
-        gap = bin_widths[0] * 2  # Gap between last bin and overflow bin
+        gap = bin_widths[0] * 0.5  # Smaller gap to reduce white space
         overflow_position = bin_edges[-1] + gap + bin_widths[0] / 2
 
-        # Plot the overflow bar in a different color
+        # Plot the overflow bar in the same color
         ax.bar(overflow_position, overflow_count, width=bin_widths[0],
-               edgecolor='black', alpha=0.7, color='coral',
-               label=f'≥ {max_value}')
+               edgecolor='black', alpha=0.7, color='steelblue')
 
         # Add custom x-tick for overflow bin
-        xticks = list(ax.get_xticks())
+        # Get current ticks but filter out any that are too close to the overflow position
+        current_xticks = ax.get_xticks()
+        # Only keep ticks that are not too close to where we'll put the overflow tick
+        xticks = [x for x in current_xticks if x < bin_edges[-1] - bin_widths[0]]
         xticks.append(overflow_position)
         ax.set_xticks(xticks)
 
-        # Get current tick labels and add the overflow label
-        xticklabels = [f'{int(x)}' if x <= bin_edges[-1] else f'≥ {max_value}'
-                       for x in xticks]
+        # Create labels: regular numbers for regular ticks, special label for overflow
+        xticklabels = [f'{int(x)}' for x in xticks[:-1]] + [f'≥{max_value}']
         ax.set_xticklabels(xticklabels, rotation=45, ha='right')
 
         # Add a visual separator (dashed line)
         separator_x = bin_edges[-1] + gap / 2
         ax.axvline(x=separator_x, color='gray', linestyle='--', linewidth=1, alpha=0.5)
-
-        # Add legend
-        ax.legend(loc='upper right')
 
     ax.set_xlabel('Sample Count', fontsize=12)
     ax.set_ylabel('Frequency', fontsize=12)
@@ -157,27 +155,24 @@ def plot_histogram(hist_counts, bin_edges, save_path='sample_count_histogram.png
 
     # Add overflow bin for log scale plot
     if max_value is not None and overflow_count > 0:
-        gap = bin_widths[0] * 2
+        gap = bin_widths[0] * 0.5  # Smaller gap to reduce white space
         overflow_position = bin_edges[-1] + gap + bin_widths[0] / 2
 
         ax.bar(overflow_position, overflow_count, width=bin_widths[0],
-               edgecolor='black', alpha=0.7, color='coral',
-               label=f'≥ {max_value}')
+               edgecolor='black', alpha=0.7, color='steelblue')
 
         # Add custom x-tick for overflow bin
-        xticks = list(ax.get_xticks())
+        current_xticks = ax.get_xticks()
+        xticks = [x for x in current_xticks if x < bin_edges[-1] - bin_widths[0]]
         xticks.append(overflow_position)
         ax.set_xticks(xticks)
 
-        xticklabels = [f'{int(x)}' if x <= bin_edges[-1] else f'≥ {max_value}'
-                       for x in xticks]
+        xticklabels = [f'{int(x)}' for x in xticks[:-1]] + [f'≥{max_value}']
         ax.set_xticklabels(xticklabels, rotation=45, ha='right')
 
         # Add separator
         separator_x = bin_edges[-1] + gap / 2
         ax.axvline(x=separator_x, color='gray', linestyle='--', linewidth=1, alpha=0.5)
-
-        ax.legend(loc='upper right')
 
     ax.set_xlabel('Sample Count', fontsize=12)
     ax.set_ylabel('Frequency (log scale)', fontsize=12)
