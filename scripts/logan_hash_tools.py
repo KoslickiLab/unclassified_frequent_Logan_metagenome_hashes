@@ -313,6 +313,15 @@ def compute_counts(args):
 
     echo("Done: compute-counts")
 
+def check_overwrite_dir(path: Path, overwrite: bool, what: str):
+    # Refuse to write into a non-empty existing directory unless --overwrite
+    if path.exists() and any(path.iterdir()):
+        if not overwrite:
+            raise SystemExit(f"{what} already exists and is non-empty: {path}\n"
+                             f"Refusing to overwrite (use --overwrite to allow).")
+
+def sql_quote(s: str) -> str:
+    return s.replace("'", "''")
 
 def percentiles(args):
     """
@@ -327,6 +336,21 @@ def percentiles(args):
     temp_dir = Path(args.temp_dir)
     ensure_dir(temp_dir)
     con = duckdb_connect(working_db, read_only=False, threads=args.threads, memory_limit=args.memory_limit, temp_dir=temp_dir)
+
+    def detect_list_agg(con) -> str:
+        """
+        Pick a list aggregation function supported by this DuckDB build.
+        DuckDB v1.3.x supports list(); some builds also support array_agg().
+        """
+        try:
+            con.execute("SELECT list(x) FROM (VALUES (1)) t(x);")
+            return "list"
+        except Exception:
+            try:
+                con.execute("SELECT array_agg(x) FROM (VALUES (1)) t(x);")
+                return "array_agg"
+            except Exception as e:
+                raise RuntimeError("Neither list() nor array_agg() is available for list aggregation") from e
 
     # Load counts
     if args.counts_path:
@@ -397,27 +421,63 @@ def percentiles(args):
         map_dir = Path(args.map_out)
         check_overwrite_dir(map_dir, args.overwrite, "Map output dir")
         ensure_dir(map_dir)
-        # Controlled sharding: write N big files, one per shard
+
+        # Controlled sharding options
         num_shards = int(getattr(args, "pairs_shards", 128))
         rg_size = int(getattr(args, "pairs_row_group_size", 1_000_000))
-        prefix = getattr(args, "pairs_file_prefix", "pairs_shard_")
-        echo(f"Writing hash→sample pairs with controlled sharding: {num_shards} shards (ROW_GROUP_SIZE={rg_size})")
-        for shard in range(num_shards):
-            shard_path = map_dir / f"{prefix}{shard:04d}.parquet"
-            check_overwrite(shard_path, args.overwrite, "Shard parquet")
-            shard_path_q = sql_quote(str(shard_path))
-            echo(f"  -> shard {shard+1}/{num_shards} (id={shard}) -> {shard_path.name}")
-            # One big file per shard; DISTINCT removes intra-sample dupes
-            con.execute(f"""
-                COPY (
-                  SELECT DISTINCT s.min_hash, s.sample_id
-                  FROM {fq} s
-                  JOIN _selected_hashes sh ON sh.min_hash = s.min_hash
-                  WHERE s.ksize = {args.ksize} AND (s.min_hash % {num_shards}) = {shard}
-                )
-                TO '{shard_path_q}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {rg_size});
-            """)
-        echo("Finished writing hash→sample pairs (sharded).")
+        shard_key = getattr(args, "pairs_shard_key", "hash")  # 'hash' or 'sample'
+        if shard_key not in ("hash", "sample"):
+            raise SystemExit("--pairs-shard-key must be 'hash' or 'sample'")
+
+        if getattr(args, "pairs_as_lists", False):
+            # --- Aggregated LIST form per shard ---
+            agg_fn = detect_list_agg(con)
+            prefix = getattr(args, "pairs_file_prefix", "pairs_lists_shard_")
+            sort_lists = getattr(args, "pairs_sort_lists", False)
+            echo(f"Writing aggregated hash→sample lists: {num_shards} shards (ROW_GROUP_SIZE={rg_size}, shard_key={shard_key})")
+            for shard in range(num_shards):
+                shard_path = map_dir / f"{prefix}{shard:04d}.parquet"
+                check_overwrite(shard_path, args.overwrite, "Shard parquet")
+                shard_path_q = sql_quote(str(shard_path))
+                echo(f"  -> shard {shard+1}/{num_shards} (id={shard}) -> {shard_path.name}")
+                if shard_key == "hash":
+                    shard_pred = f"(s.min_hash % {num_shards}) = {shard}"
+                else:
+                    shard_pred = f"(hash(s.sample_id) % {num_shards}) = {shard}"
+                list_expr = f"{agg_fn}(sample_id)"
+                if sort_lists:
+                    list_expr = f"list_sort({list_expr})"
+                # Use DISTINCT pairs to avoid duplicate sample_ids per hash, then aggregate
+                con.execute(f"""
+                    COPY (
+                      SELECT
+                        min_hash,
+                        COUNT(*) AS sample_count,
+                        {list_expr} AS sample_ids
+                      FROM (
+                        SELECT DISTINCT s.min_hash AS min_hash, s.sample_id AS sample_id
+                        FROM {fq} s
+                        JOIN _selected_hashes sh ON sh.min_hash = s.min_hash
+                        WHERE s.ksize = {args.ksize} AND {shard_pred}
+                      ) d
+                      GROUP BY min_hash
+                    )
+                    TO '{shard_path_q}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {rg_size});
+                """)
+            echo("Finished writing aggregated hash→sample lists (sharded).")
+        else:
+            # --- Flat pairs form per shard (existing behavior) ---
+            prefix = getattr(args, "pairs_file_prefix", "pairs_shard_")
+            echo(f"Writing hash→sample pairs: {num_shards} shards (ROW_GROUP_SIZE={rg_size}, shard_key={shard_key})")
+            for shard in range(num_shards):
+                shard_path = map_dir / f"{prefix}{shard:04d}.parquet"
+                check_overwrite(shard_path, args.overwrite, "Shard parquet")
+                shard_path_q = sql_quote(str(shard_path))
+                echo(f"  -> shard {shard+1}/{num_shards} (id={shard}) -> {shard_path.name}")
+                if shard_key == "hash":
+                    shard_pred = f"(s.min_hash % {num_shards}) = {shard}"
+                else:
+                    shard_pred = f"(hash(s.sample_id) % {num_shards}) = {shard}"
 
     if args.counts_source == "sample" and args.emit_sample_list:
         echo("Materializing sample_id list in percentile range ...")
@@ -520,6 +580,13 @@ def main(argv=None):
                        help="Number of output parquet shards for hash→sample pairs (smaller = fewer, bigger files)")
     p_pct.add_argument("--pairs-row-group-size", type=int, default=1_000_000,
                        help="ROW_GROUP_SIZE to use when writing shards")
+    p_pct.add_argument("--pairs-file-prefix", default="pairs_shard_", help="File prefix for shard parquet files")
+    p_pct.add_argument("--pairs-shard-key", default="hash", choices=["hash","sample"],
+                       help="Sharding key: by min_hash or by sample_id hash()")
+    p_pct.add_argument("--pairs-as-lists", action="store_true",
+                       help="Write aggregated list form per shard: (min_hash, sample_count, sample_ids LIST<VARCHAR>)")
+    p_pct.add_argument("--pairs-sort-lists", action="store_true",
+                       help="Sort values inside each aggregated list")
 
     # attach DB for mapping step
     p_pct.add_argument("--attach-db", default="", help="Path to giant database_all.db (required if --emit-mapping-for-hashes)")
