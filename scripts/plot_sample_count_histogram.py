@@ -139,6 +139,15 @@ def plot_histogram(hist_counts, bin_edges, save_path='sample_count_histogram.png
     ax.set_title('Distribution of Sample Count', fontsize=14, fontweight='bold')
     ax.grid(axis='y', alpha=0.3)
 
+    # Set x-axis to start at 0
+    if max_value is not None and overflow_count > 0:
+        # Include overflow bin in the range
+        gap = bin_widths[0] * 0.5
+        overflow_position = bin_edges[-1] + gap + bin_widths[0] / 2
+        ax.set_xlim(0, overflow_position + bin_widths[0])
+    else:
+        ax.set_xlim(0, bin_edges[-1] + bin_widths[0])
+
     # Format y-axis with comma separators
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{int(x):,}'))
 
@@ -179,6 +188,15 @@ def plot_histogram(hist_counts, bin_edges, save_path='sample_count_histogram.png
     ax.set_title('Distribution of Sample Count (Log Scale)', fontsize=14, fontweight='bold')
     ax.set_yscale('log')
     ax.grid(axis='y', alpha=0.3, which='both')
+
+    # Set x-axis to start at 0
+    if max_value is not None and overflow_count > 0:
+        # Include overflow bin in the range
+        gap = bin_widths[0] * 0.5
+        overflow_position = bin_edges[-1] + gap + bin_widths[0] / 2
+        ax.set_xlim(0, overflow_position + bin_widths[0])
+    else:
+        ax.set_xlim(0, bin_edges[-1] + bin_widths[0])
 
     plt.tight_layout()
     log_path = save_path.replace('.png', '_log.png')
