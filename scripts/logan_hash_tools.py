@@ -467,16 +467,13 @@ def percentiles(args):
                 con.execute(f"""
                     COPY (
                       SELECT
-                        min_hash,
+                        s.min_hash,
                         COUNT(*) AS sample_count,
                         {list_expr} AS sample_ids
-                      FROM (
-                        SELECT DISTINCT s.min_hash AS min_hash, s.sample_id AS sample_id
-                        FROM {fq} s
-                        JOIN _selected_hashes sh ON sh.min_hash = s.min_hash
-                        WHERE s.ksize = {args.ksize} AND {shard_pred}
-                      ) d
-                      GROUP BY min_hash
+                      FROM {fq} s
+                      JOIN _selected_hashes sh ON sh.min_hash = s.min_hash
+                      WHERE s.ksize = {args.ksize} AND {shard_pred}
+                      GROUP BY s.min_hash
                     )
                     TO '{shard_path_q}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {rg_size});
                 """)
