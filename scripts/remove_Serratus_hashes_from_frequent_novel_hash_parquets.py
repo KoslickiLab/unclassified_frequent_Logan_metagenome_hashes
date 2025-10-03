@@ -107,7 +107,8 @@ if __name__ == "__main__":
     # Configuration
     PARQUET_DIR = "/scratch/dmk333_new/unclassified_frequent_Logan_metagenome_hashes/data/hash_and_sample_id_counts/hash_counts_25_10000/hash_pct_25_10000_lists"
     DUCKDB_PATH = "/scratch/dmk333_new/known_microbe_hashes/Serratus_viruses/data/Serratus_viruses_unique_hashes.db"
-    OUTPUT_PATH = "/scratch/dmk333_new/filtered_hashes_no_viruses.parquet"
+    OUTPUT_PATH = ("/scratch/dmk333_new/unclassified_frequent_Logan_metagenome_hashes/data/hash_and_sample_id_counts"
+                   "/hash_counts_25_10000/filtered_frequent_novel_hashes_no_viruses.parquet")
     
     # Run the filtering
     filter_and_union_hashes(
