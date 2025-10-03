@@ -18,13 +18,13 @@ def main():
     ap = argparse.ArgumentParser(
         description="Union sharded Parquet files and exclude rows whose min_hash is present in a DuckDB table (ksize=31 by default)."
     )
-    ap.add_argument("--input-dir", required=True,
+    ap.add_argument("--input-dir", required=False,
                     help="Directory containing pairs_lists_shard_*.parquet files.",
                     default="/scratch/dmk333_new/unclassified_frequent_Logan_metagenome_hashes/data/hash_and_sample_id_counts/hash_counts_25_10000/hash_pct_25_10000_lists")
-    ap.add_argument("--duckdb-path", required=True,
+    ap.add_argument("--duckdb-path", required=False,
                     help="Path to Serratus_viruses_unique_hashes.db (DuckDB database).",
                     default="/scratch/dmk333_new/known_microbe_hashes/Serratus_viruses/data/Serratus_viruses_unique_hashes.db")
-    ap.add_argument("--output-parquet", required=True,
+    ap.add_argument("--output-parquet", required=False,
                     help="Path to write the single output Parquet file.",
                     default="/scratch/dmk333_new/unclassified_frequent_Logan_metagenome_hashes/data"
                             "/hash_and_sample_id_counts/hash_counts_25_10000/filtered_hashes_no_Serratus.parquet")
