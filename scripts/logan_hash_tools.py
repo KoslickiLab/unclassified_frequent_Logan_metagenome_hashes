@@ -225,6 +225,15 @@ def prepare_hashes(args):
 
     echo("Done: prepare-hashes")
 
+def check_overwrite_dir(path: Path, overwrite: bool, what: str):
+    # Refuse to write into a non-empty existing directory unless --overwrite
+    if path.exists() and any(path.iterdir()):
+        if not overwrite:
+            raise SystemExit(f"{what} already exists and is non-empty: {path}\n"
+                             f"Refusing to overwrite (use --overwrite to allow).")
+
+def sql_quote(s: str) -> str:
+    return s.replace("'", "''")
 
 def compute_counts(args):
     """
@@ -260,7 +269,7 @@ def compute_counts(args):
         con.execute("CREATE TEMPORARY VIEW _pairs AS "
                     f"SELECT DISTINCT s.sample_id, CAST(s.min_hash AS BIGINT) AS min_hash "
                     f"FROM {fq} s JOIN working.hashes h ON h.min_hash = s.min_hash "
-                    f"WHERE s.ksize = ?;", [args.ksize])
+                    f"WHERE s.ksize = {args.ksize};")
 
         # Partition key for manageable file sizes
         con.execute("""
@@ -304,6 +313,15 @@ def compute_counts(args):
 
     echo("Done: compute-counts")
 
+def check_overwrite_dir(path: Path, overwrite: bool, what: str):
+    # Refuse to write into a non-empty existing directory unless --overwrite
+    if path.exists() and any(path.iterdir()):
+        if not overwrite:
+            raise SystemExit(f"{what} already exists and is non-empty: {path}\n"
+                             f"Refusing to overwrite (use --overwrite to allow).")
+
+def sql_quote(s: str) -> str:
+    return s.replace("'", "''")
 
 def percentiles(args):
     """
@@ -319,25 +337,41 @@ def percentiles(args):
     ensure_dir(temp_dir)
     con = duckdb_connect(working_db, read_only=False, threads=args.threads, memory_limit=args.memory_limit, temp_dir=temp_dir)
 
+    def detect_list_agg(con) -> str:
+        """
+        Pick a list aggregation function supported by this DuckDB build.
+        DuckDB v1.3.x supports list(); some builds also support array_agg().
+        """
+        try:
+            con.execute("SELECT list(x) FROM (VALUES (1)) t(x);")
+            return "list"
+        except Exception:
+            try:
+                con.execute("SELECT array_agg(x) FROM (VALUES (1)) t(x);")
+                return "array_agg"
+            except Exception as e:
+                raise RuntimeError("Neither list() nor array_agg() is available for list aggregation") from e
+
     # Load counts
     if args.counts_path:
-        # External parquet counts
-        con.execute("CREATE OR REPLACE TEMPORARY VIEW _counts AS SELECT * FROM read_parquet(?);", [args.counts_path])
+        counts_path = str(Path(args.counts_path))
     else:
         # Counts previously written into out_dir (hash_counts.parquet / sample_counts.parquet)
-        # Create views if those files exist; else error
-        default_counts = None
         if args.counts_source == "hash":
-            default_counts = Path(args.out_dir) / "hash_counts.parquet"
+            counts_path = str(Path(args.out_dir) / "hash_counts.parquet")
         else:
-            default_counts = Path(args.out_dir) / "sample_counts.parquet"
-        if not default_counts.exists():
-            raise SystemExit(f"Could not find counts parquet at {default_counts}. Use --counts-path to point to it.")
-        con.execute("CREATE OR REPLACE TEMPORARY VIEW _counts AS SELECT * FROM read_parquet(?);", [str(default_counts)])
+            counts_path = str(Path(args.out_dir) / "sample_counts.parquet")
+        if not Path(counts_path).exists():
+            raise SystemExit(f"Could not find counts parquet at {counts_path}. Use --counts-path to point to it.")
 
-    p_low, p_high = args.percentiles
-    if not (0.0 <= p_low <= 1.0 and 0.0 <= p_high <= 1.0 and p_low <= p_high):
-        raise SystemExit("--percentiles must be two floats in [0,1], with low <= high.")
+    echo(f"Loading counts from: {counts_path}")
+    counts_path_q = sql_quote(counts_path)
+    con.execute(f"CREATE OR REPLACE TEMPORARY VIEW _counts AS SELECT * FROM read_parquet('{counts_path_q}');")
+    try:
+        n_counts = con.execute("SELECT COUNT(*) FROM _counts;").fetchone()[0]
+        echo(f"_counts loaded: {n_counts:,} rows")
+    except Exception as _e:
+        echo(f"WARNING: could not count _counts rows: {_e}")
 
     # Identify the count column
     if args.counts_source == "hash":
@@ -347,11 +381,31 @@ def percentiles(args):
         count_col = "matched_hash_count"
         key_col = "sample_id"
 
-    # Compute quantiles
-    echo(f"Computing quantiles for {count_col}: p_low={p_low}, p_high={p_high}")
-    row = con.execute(f"SELECT quantile_cont({count_col}, {p_low}), quantile_cont({count_col}, {p_high}) FROM _counts;").fetchone()
-    low_cut, high_cut = row[0], row[1]
-    echo(f"Percentile cutpoints: low={low_cut}, high={high_cut}")
+    # Determine cut mode: percentiles or explicit cuts
+    mode = None
+    p_low = p_high = None
+    if args.percentiles is not None:
+        p_low, p_high = args.percentiles
+        if not (0.0 <= p_low <= 1.0 and 0.0 <= p_high <= 1.0 and p_low <= p_high):
+            raise SystemExit("--percentiles must be two floats in [0,1], with low <= high.")
+        mode = "percentiles"
+        echo(f"Computing quantiles for {count_col}: p_low={p_low}, p_high={p_high}")
+        row = con.execute(
+            f"SELECT quantile_cont({count_col}, {p_low}), quantile_cont({count_col}, {p_high}) FROM _counts;"
+        ).fetchone()
+        low_cut, high_cut = row[0], row[1]
+        echo(f"Percentile cutpoints: low={low_cut}, high={high_cut}")
+    else:
+        mode = "manual_cuts"
+        low_cut = float(args.low_cut)
+        high_cut = float(args.high_cut)
+        echo(f"Using user-specified cutpoints for {count_col}: low_cut={low_cut}, high_cut={high_cut}")
+        # (Optional sanity) Show coverage
+        try:
+            n_sel_preview = con.execute(f"SELECT COUNT(*) FROM _counts WHERE {count_col} >= {low_cut} AND {count_col} <= {high_cut};").fetchone()[0]
+            echo(f"Rows in cut range (preview on counts parquet): {n_sel_preview:,}")
+        except Exception as _e:
+            echo(f"WARNING: could not preview selection size: {_e}")
 
     # Persist cutpoints
     cp_path = Path(args.out_dir) / f"{args.counts_source}_percentiles.json"
@@ -370,21 +424,73 @@ def percentiles(args):
         # Selected hashes
         con.execute(f"""
             CREATE OR REPLACE TEMPORARY VIEW _selected_hashes AS
-            SELECT {key_col} AS min_hash FROM _counts WHERE {count_col} >= ? AND {count_col} <= ?;
-        """, [low_cut, high_cut])
+            SELECT {key_col} AS min_hash
+            FROM _counts
+            WHERE {count_col} >= {low_cut} AND {count_col} <= {high_cut};
+        """)
+        try:
+            n_sel = con.execute("SELECT COUNT(*) FROM _selected_hashes;").fetchone()[0]
+            echo(f"Selected hashes in percentile range: {n_sel:,}")
+        except Exception as _e:
+            echo(f"WARNING: could not count _selected_hashes rows: {_e}")
 
-        ensure_dir(Path(args.map_out))
-        # For exactness and to remove intra-sample duplicates, use DISTINCT on pairs
-        # Partition by 'part' to many small files
-        con.execute(f"""
-            COPY (
-              SELECT DISTINCT s.min_hash, s.sample_id, (s.min_hash % 1024) AS part
-              FROM {fq} s
-              JOIN _selected_hashes sh ON sh.min_hash = s.min_hash
-              WHERE s.ksize = {args.ksize}
-            )
-            TO ? (FORMAT PARQUET, COMPRESSION ZSTD, PARTITION_BY (part), ROW_GROUP_SIZE 1000000);
-        """, [str(Path(args.map_out))])
+        map_dir = Path(args.map_out)
+        check_overwrite_dir(map_dir, args.overwrite, "Map output dir")
+        ensure_dir(map_dir)
+
+        # Controlled sharding options
+        num_shards = int(getattr(args, "pairs_shards", 128))
+        rg_size = int(getattr(args, "pairs_row_group_size", 1_000_000))
+        shard_key = getattr(args, "pairs_shard_key", "hash")  # 'hash' or 'sample'
+        if shard_key not in ("hash", "sample"):
+            raise SystemExit("--pairs-shard-key must be 'hash' or 'sample'")
+
+        if getattr(args, "pairs_as_lists", False):
+            # --- Aggregated LIST form per shard ---
+            agg_fn = detect_list_agg(con)
+            prefix = getattr(args, "pairs_file_prefix", "pairs_lists_shard_")
+            sort_lists = getattr(args, "pairs_sort_lists", False)
+            echo(f"Writing aggregated hash→sample lists: {num_shards} shards (ROW_GROUP_SIZE={rg_size}, shard_key={shard_key})")
+            for shard in range(num_shards):
+                shard_path = map_dir / f"{prefix}{shard:04d}.parquet"
+                check_overwrite(shard_path, args.overwrite, "Shard parquet")
+                shard_path_q = sql_quote(str(shard_path))
+                echo(f"  -> shard {shard+1}/{num_shards} (id={shard}) -> {shard_path.name}")
+                if shard_key == "hash":
+                    shard_pred = f"(s.min_hash % {num_shards}) = {shard}"
+                else:
+                    shard_pred = f"(hash(s.sample_id) % {num_shards}) = {shard}"
+                list_expr = f"{agg_fn}(sample_id)"
+                if sort_lists:
+                    list_expr = f"list_sort({list_expr})"
+                # Use DISTINCT pairs to avoid duplicate sample_ids per hash, then aggregate
+                con.execute(f"""
+                    COPY (
+                      SELECT
+                        s.min_hash,
+                        COUNT(*) AS sample_count,
+                        {list_expr} AS sample_ids
+                      FROM {fq} s
+                      JOIN _selected_hashes sh ON sh.min_hash = s.min_hash
+                      WHERE s.ksize = {args.ksize} AND {shard_pred}
+                      GROUP BY s.min_hash
+                    )
+                    TO '{shard_path_q}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {rg_size});
+                """)
+            echo("Finished writing aggregated hash→sample lists (sharded).")
+        else:
+            # --- Flat pairs form per shard (existing behavior) ---
+            prefix = getattr(args, "pairs_file_prefix", "pairs_shard_")
+            echo(f"Writing hash→sample pairs: {num_shards} shards (ROW_GROUP_SIZE={rg_size}, shard_key={shard_key})")
+            for shard in range(num_shards):
+                shard_path = map_dir / f"{prefix}{shard:04d}.parquet"
+                check_overwrite(shard_path, args.overwrite, "Shard parquet")
+                shard_path_q = sql_quote(str(shard_path))
+                echo(f"  -> shard {shard+1}/{num_shards} (id={shard}) -> {shard_path.name}")
+                if shard_key == "hash":
+                    shard_pred = f"(s.min_hash % {num_shards}) = {shard}"
+                else:
+                    shard_pred = f"(hash(s.sample_id) % {num_shards}) = {shard}"
 
     if args.counts_source == "sample" and args.emit_sample_list:
         echo("Materializing sample_id list in percentile range ...")
@@ -472,7 +578,9 @@ def main(argv=None):
     p_pct.add_argument("--out-dir", required=True, help="Directory where counts parquet live (or where percentiles JSON will be written)")
     p_pct.add_argument("--counts-source", choices=["hash","sample"], required=True, help="Which counts are we analyzing")
     p_pct.add_argument("--counts-path", default="", help="Explicit path to counts parquet; otherwise uses out-dir default")
-    p_pct.add_argument("--percentiles", nargs=2, type=float, required=True, metavar=("LOW","HIGH"), help="Two floats in [0,1]")
+    p_pct.add_argument("--percentiles", nargs=2, type=float, metavar=("LOW","HIGH"), help="Two floats in [0,1] (use instead of --low-cut/--high-cut)")
+    p_pct.add_argument("--low-cut", type=float, default=None, help="Explicit lower cutpoint (inclusive) on the count column")
+    p_pct.add_argument("--high-cut", type=float, default=None, help="Explicit upper cutpoint (inclusive) on the count column")
     p_pct.add_argument("--threads", type=int, default=os.cpu_count() or 64, help="DuckDB threads")
     p_pct.add_argument("--memory-limit", default="3500GB", help="DuckDB memory limit (e.g., '3500GB' or '3.5TB')")
     p_pct.add_argument("--temp-dir", default="/scratch/duck_tmp", help="Directory for DuckDB temp & spills")
@@ -482,6 +590,18 @@ def main(argv=None):
     p_pct.add_argument("--emit-mapping-for-hashes", action="store_true", help="Emit DISTINCT(min_hash,sample_id) for hashes in percentile range")
     p_pct.add_argument("--map-out", default="", help="Output dir for hash->sample_id pairs parquet (required if --emit-mapping-for-hashes)")
     p_pct.add_argument("--ksize", type=int, default=31, help="K-mer size filter for mapping")
+    # fewer, bigger files: write a fixed number of shards instead of per-thread fragments
+    p_pct.add_argument("--pairs-shards", type=int, default=128,
+                       help="Number of output parquet shards for hash→sample pairs (smaller = fewer, bigger files)")
+    p_pct.add_argument("--pairs-row-group-size", type=int, default=1_000_000,
+                       help="ROW_GROUP_SIZE to use when writing shards")
+    p_pct.add_argument("--pairs-file-prefix", default="pairs_shard_", help="File prefix for shard parquet files")
+    p_pct.add_argument("--pairs-shard-key", default="hash", choices=["hash","sample"],
+                       help="Sharding key: by min_hash or by sample_id hash()")
+    p_pct.add_argument("--pairs-as-lists", action="store_true",
+                       help="Write aggregated list form per shard: (min_hash, sample_count, sample_ids LIST<VARCHAR>)")
+    p_pct.add_argument("--pairs-sort-lists", action="store_true",
+                       help="Sort values inside each aggregated list")
 
     # attach DB for mapping step
     p_pct.add_argument("--attach-db", default="", help="Path to giant database_all.db (required if --emit-mapping-for-hashes)")
@@ -521,12 +641,27 @@ def main(argv=None):
             p.error("--emit-mapping-for-hashes requires --attach-db")
         if args.emit_sample_list and not args.sample_list_out:
             p.error("--emit-sample-list requires --sample-list-out")
+        # XOR validation for cut specification
+        pct_specified = args.percentiles is not None
+        cuts_specified = (args.low_cut is not None) or (args.high_cut is not None)
+        if pct_specified and cuts_specified:
+            p.error("Provide either --percentiles LOW HIGH or --low-cut X --high-cut Y, not both.")
+        if not pct_specified and not cuts_specified:
+            p.error("You must provide either --percentiles LOW HIGH or --low-cut X --high-cut Y.")
+        if cuts_specified and (args.low_cut is None or args.high_cut is None):
+            p.error("Both --low-cut and --high-cut are required when using explicit cutpoints.")
+        if cuts_specified and (args.low_cut > args.high_cut):
+            p.error("--low-cut must be <= --high-cut.")
 
     # Execute
     try:
         args.func(args)
     except Exception as e:
-        echo(f"ERROR: {e}")
+        # Print full traceback for easier debugging (line numbers & stack)
+        import traceback
+        echo(f"ERROR: {type(e).__name__}: {e}")
+        tb = traceback.format_exc()
+        print(tb, file=sys.stderr, flush=True)
         sys.exit(2)
 
 
