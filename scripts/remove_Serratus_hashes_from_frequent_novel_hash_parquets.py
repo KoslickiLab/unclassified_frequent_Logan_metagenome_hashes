@@ -80,12 +80,13 @@ def main():
         COPY (
             SELECT l.*
             FROM parquet_scan('{glob_literal}', HIVE_PARTITIONING=0) AS l
-            LEFT ANTI JOIN serratus_exclude s
+            ANTI JOIN serratus_exclude s
               ON CAST(l.min_hash AS UBIGINT) = s.hash
         )
         TO '{out_literal}'
         (FORMAT PARQUET, COMPRESSION ZSTD)
     """
+    print(copy_sql)
     con.execute(copy_sql)
 
     # Optional: confirm output row count
