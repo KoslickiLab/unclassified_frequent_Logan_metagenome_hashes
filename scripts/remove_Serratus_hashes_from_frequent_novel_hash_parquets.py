@@ -80,7 +80,7 @@ def main():
         COPY (
             SELECT l.*
             FROM parquet_scan('{glob_literal}', HIVE_PARTITIONING=0) AS l
-            ANTI JOIN serratus_exclude s
+            LEFT ANTI JOIN serratus_exclude s
               ON CAST(l.min_hash AS UBIGINT) = s.hash
         )
         TO '{out_literal}'
