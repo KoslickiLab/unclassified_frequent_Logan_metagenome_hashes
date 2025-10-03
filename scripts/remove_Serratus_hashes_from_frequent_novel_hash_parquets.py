@@ -1,121 +1,99 @@
-#!/usr/bin/env env python3
-"""
-Filter genomic hash data by excluding viral hashes.
-
-This script:
-1. Loads viral hashes from a DuckDB database (ksize=31)
-2. Reads all sharded parquet files containing hash data
-3. Filters out hashes that appear in the viral database
-4. Writes the filtered result to a single parquet file
-"""
-
+#!/usr/bin/env python3
+import argparse
+import os
+import sys
+import glob
 import duckdb
-from pathlib import Path
-import time
+from multiprocessing import cpu_count
 
+def escape_sql_str(s: str) -> str:
+    """Escape single quotes for SQL string literals."""
+    return s.replace("'", "''")
 
-def filter_and_union_hashes(
-        parquet_dir: str,
-        duckdb_path: str,
-        output_path: str,
-        ksize: int = 31
-) -> None:
+def quote_ident(ident: str) -> str:
+    """Quote an SQL identifier (e.g., table name)."""
+    return '"' + ident.replace('"', '""') + '"'
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Union sharded Parquet files and exclude rows whose min_hash is present in a DuckDB table (ksize=31 by default)."
+    )
+    ap.add_argument("--input-dir", required=True,
+                    help="Directory containing pairs_lists_shard_*.parquet files.",
+                    default="/scratch/dmk333_new/unclassified_frequent_Logan_metagenome_hashes/data/hash_and_sample_id_counts/hash_counts_25_10000/hash_pct_25_10000_lists")
+    ap.add_argument("--duckdb-path", required=True,
+                    help="Path to Serratus_viruses_unique_hashes.db (DuckDB database).",
+                    default="/scratch/dmk333_new/known_microbe_hashes/Serratus_viruses/data/Serratus_viruses_unique_hashes.db")
+    ap.add_argument("--output-parquet", required=True,
+                    help="Path to write the single output Parquet file.",
+                    default="/scratch/dmk333_new/unclassified_frequent_Logan_metagenome_hashes/data"
+                            "/hash_and_sample_id_counts/hash_counts_25_10000/filtered_hashes_no_Serratus.parquet")
+    ap.add_argument("--ksize", type=int, default=31,
+                    help="ksize to filter on in the DuckDB table (default: 31).")
+    ap.add_argument("--table", default="unique_hashes",
+                    help="Table name inside the DuckDB database (default: unique_hashes).")
+    ap.add_argument("--threads", type=int, default=max(1, cpu_count() - 1),
+                    help="Number of threads DuckDB can use (default: CPU-1).")
+    args = ap.parse_args()
+
+    parquet_glob = os.path.join(args.input_dir, "pairs_lists_shard_*.parquet")
+    matches = glob.glob(parquet_glob)
+    if not matches:
+        print(f"[error] No matching .parquet files found at pattern: {parquet_glob}", file=sys.stderr)
+        sys.exit(1)
+
+    out_dir = os.path.dirname(os.path.abspath(args.output_parquet)) or "."
+    os.makedirs(out_dir, exist_ok=True)
+
+    con = duckdb.connect(database=":memory:")
+    con.execute(f"PRAGMA threads={int(args.threads)}")
+    try:
+        con.execute("PRAGMA enable_progress_bar=true")
+    except Exception:
+        pass
+
+    # Attach the Serratus database
+    con.execute(f"ATTACH '{escape_sql_str(args.duckdb_path)}' AS serr")
+
+    serr_table = f"serr.{quote_ident(args.table)}"
+    ksize_val = int(args.ksize)
+
+    # Sanity check: rows at requested ksize
+    count_sql = f"SELECT COUNT(*) FROM {serr_table} WHERE ksize = {ksize_val}"
+    (n_ksize_rows,) = con.execute(count_sql).fetchone()
+    if n_ksize_rows == 0:
+        print(f"[warn] No rows found in {serr_table} with ksize={ksize_val}. Nothing will be excluded.", file=sys.stderr)
+
+    # Create a temp view of hashes to exclude
+    create_view_sql = f"""
+        CREATE TEMP VIEW serratus_exclude AS
+        SELECT CAST(hash AS UBIGINT) AS hash
+        FROM {serr_table}
+        WHERE ksize = {ksize_val}
     """
-    Filter hash data by excluding hashes from DuckDB database.
+    con.execute(create_view_sql)
 
-    Args:
-        parquet_dir: Directory containing pairs_lists_shard_*.parquet files
-        duckdb_path: Path to DuckDB database with hashes to exclude
-        output_path: Path for output parquet file
-        ksize: K-mer size to filter from DuckDB (default: 31)
-    """
-    start_time = time.time()
-
-    # Initialize DuckDB connection
-    con = duckdb.connect()
-
-    print(f"Step 1: Loading viral hashes from {duckdb_path} (ksize={ksize})...")
-
-    # Attach the DuckDB database
-    con.execute(f"ATTACH '{duckdb_path}' AS viral_db (READ_ONLY)")
-
-    # Load the viral hashes into a temporary table
-    # Only select ksize=31 hashes
-    con.execute(f"""
-        CREATE TEMP TABLE viral_hashes AS
-        SELECT hash
-        FROM viral_db.unique_hashes
-        WHERE ksize = {ksize}
-    """)
-
-    viral_hash_count = con.execute("SELECT COUNT(*) FROM viral_hashes").fetchone()[0]
-    print(f"   Loaded {viral_hash_count:,} viral hashes")
-
-    print(f"\nStep 2: Reading parquet files from {parquet_dir}...")
-
-    # Find all parquet files
-    parquet_pattern = str(Path(parquet_dir) / "pairs_lists_shard_*.parquet")
-
-    # Count input files
-    file_count = con.execute(f"""
-        SELECT COUNT(*) 
-        FROM glob('{parquet_pattern}')
-    """).fetchone()[0]
-    print(f"   Found {file_count} parquet files")
-
-    # Get total row count before filtering
-    total_rows = con.execute(f"""
-        SELECT COUNT(*) 
-        FROM '{parquet_pattern}'
-    """).fetchone()[0]
-    print(f"   Total rows before filtering: {total_rows:,}")
-
-    print(f"\nStep 3: Filtering hashes and creating union...")
-
-    # Read all parquet files, filter out viral hashes, and write to output
-    # Using LEFT ANTI JOIN for efficient exclusion
-    con.execute(f"""
+    # Perform streaming anti-join and write to a single Parquet
+    glob_literal = escape_sql_str(parquet_glob)
+    out_literal = escape_sql_str(args.output_parquet)
+    copy_sql = f"""
         COPY (
-            SELECT 
-                p.min_hash,
-                p.sample_count,
-                p.sample_ids
-            FROM '{parquet_pattern}' p
-            LEFT ANTI JOIN viral_hashes v
-                ON p.min_hash = v.hash
-            ORDER BY p.min_hash
-        ) TO '{output_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
-    """)
+            SELECT l.*
+            FROM parquet_scan('{glob_literal}', HIVE_PARTITIONING=0) AS l
+            LEFT ANTI JOIN serratus_exclude s
+              ON CAST(l.min_hash AS UBIGINT) = s.hash
+        )
+        TO '{out_literal}'
+        (FORMAT PARQUET, COMPRESSION ZSTD)
+    """
+    con.execute(copy_sql)
 
-    # Get statistics on output
-    output_rows = con.execute(f"""
-        SELECT COUNT(*) 
-        FROM '{output_path}'
-    """).fetchone()[0]
-
-    filtered_count = total_rows - output_rows
-
-    print(f"\nStep 4: Complete!")
-    print(f"   Rows after filtering: {output_rows:,}")
-    print(f"   Rows filtered out: {filtered_count:,} ({filtered_count / total_rows * 100:.2f}%)")
-    print(f"   Output written to: {output_path}")
-
-    elapsed = time.time() - start_time
-    print(f"   Total time: {elapsed:.2f} seconds")
-
-    con.close()
-
+    # Optional: confirm output row count
+    try:
+        (out_rows,) = con.execute(f"SELECT COUNT(*) FROM parquet_scan('{out_literal}')").fetchone()
+        print(f"[ok] Wrote {out_rows:,} rows to {args.output_parquet}")
+    except Exception:
+        print(f"[ok] Wrote Parquet to {args.output_parquet}")
 
 if __name__ == "__main__":
-    # Configuration
-    PARQUET_DIR = "/scratch/dmk333_new/unclassified_frequent_Logan_metagenome_hashes/data/hash_and_sample_id_counts/hash_counts_25_10000/hash_pct_25_10000_lists"
-    DUCKDB_PATH = "/scratch/dmk333_new/known_microbe_hashes/Serratus_viruses/data/Serratus_viruses_unique_hashes.db"
-    OUTPUT_PATH = "/scratch/dmk333_new/filtered_hashes_no_viruses.parquet"
-
-    # Run the filtering
-    filter_and_union_hashes(
-        parquet_dir=PARQUET_DIR,
-        duckdb_path=DUCKDB_PATH,
-        output_path=OUTPUT_PATH,
-        ksize=31
-    )
+    main()
