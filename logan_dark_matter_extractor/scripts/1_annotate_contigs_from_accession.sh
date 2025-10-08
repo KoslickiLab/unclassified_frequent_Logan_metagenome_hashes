@@ -5,7 +5,7 @@
 # at: https://app.gitter.im/#/room/#sourmash-bio_community:gitter.im Message in a reply at 10/8/2025 to a thread
 # started 10/7/2025
 cd /scratch/dmk333_new/unclassified_frequent_Logan_metagenome_hashes
-python -m logan_darkmatter.cli annotate \
+python -m logan_dark_matter_extractor.cli annotate \
   --index-root /scratch/logan_darkmatter/novel_index \
   --workdir /scratch/logan_darkmatter/work \
   --sig-dir  /scratch/logan_darkmatter \
