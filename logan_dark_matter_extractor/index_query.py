@@ -21,11 +21,21 @@ class ShardedSortedIndex:
         meta = json.load(open(index_root / "meta.json"))
         self.shard_bits = int(meta["shard_bits"])
         self.shards = int(meta["shards"])
+        self.strategy = meta.get("shard_strategy", "topbits")  # default back-compat
         self.shards_dir = index_root / "shards"
+        # Precompute masks/constants
+        self._mask = np.uint64((1 << self.shard_bits) - 1)
+        self._shift = np.uint64(64 - self.shard_bits)
 
     def _shard_id(self, h: np.ndarray) -> np.ndarray:
-        shift = np.uint64(64 - self.shard_bits)
-        return (h >> shift).astype(np.int64, copy=False)
+        """
+        Compute shard id array from uint64 'h', consistent with builder.
+        """
+        if self.strategy == "lowbits":
+            return (h & self._mask).astype(np.int64, copy=False)
+        else:
+            # legacy (topbits) fallback for old indexes
+            return (h >> self._shift).astype(np.int64, copy=False)
 
     @lru_cache(maxsize=64)  # keep up to 64 shard arrays mmapped
     def _load_shard(self, sid: int) -> np.memmap:

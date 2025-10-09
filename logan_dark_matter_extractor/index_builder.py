@@ -41,6 +41,7 @@ class IndexMeta:
     shards: int
     dtype: str = "uint64"
     version: int = 1
+    shard_strategy: str = "lowbits"  # new: "lowbits" (old builds were effectively "topbits")
 
 def _ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
@@ -67,6 +68,7 @@ def split_parquet_to_shards(parquet_path: Path,
     # Open all shard files; keep open to reduce overhead (256 FDs default)
     fhs = [open(shards_dir / f"shard_{i:03d}.bin", "ab", buffering=1024*1024) for i in range(shards)]
     counts = np.zeros(shards, dtype=np.int64)
+    mask = np.uint64((1 << shard_bits) - 1)  # LOW-BITS mask
 
     try:
         for rg_idx in range(pf.num_row_groups):
@@ -76,8 +78,7 @@ def split_parquet_to_shards(parquet_path: Path,
             u = col.astype(np.uint64, copy=False)
 
             # shard id = top bits of 64-bit value
-            shift = np.uint64(64 - shard_bits)
-            shard_ids = (u >> shift).astype(np.int64, copy=False)
+            shard_ids = (u & mask).astype(np.int64, copy=False)
 
             # Group by shard id and write contiguous blocks
             # We sort shard_ids and u jointly by shard to write in fewer syscalls.
@@ -109,14 +110,26 @@ def split_parquet_to_shards(parquet_path: Path,
         total_rows=int(counts.sum()),
         shard_bits=shard_bits,
         shards=shards,
+        shard_strategy="lowbits",
     )
     with open(index_root / "meta.json", "w") as f:
         json.dump(asdict(meta), f, indent=2)
 
     # Save per-shard counts for logging/restarts
     np.save(index_root / "counts.npy", counts)
-    LOGGER.info("Split complete. Wrote %s total items into %d shards.",
-                f"{int(counts.sum()):,}", shards)
+    total_items = int(counts.sum())
+    nonempty = int((counts > 0).sum())
+    LOGGER.info("Split complete. Wrote %s total items into %d shards (nonempty=%d).",
+                f"{total_items:,}", shards, nonempty)
+    # Quick distribution snapshot:
+    if total_items > 0:
+        avg = total_items / shards
+        mx = counts.max()
+        mn = counts[counts > 0].min() if nonempty else 0
+        heavy = counts.argsort()[-5:][::-1]
+        LOGGER.info("Shard load avg=%.0f, min_nonempty=%s, max=%s; heaviest shards: %s",
+                    avg, f"{int(mn):,}" if nonempty else "N/A", f"{int(mx):,}",
+                    ", ".join([f"{int(i)}:{int(counts[i]):,}" for i in heavy]))
 
 def _sort_one_shard(args):
     """
