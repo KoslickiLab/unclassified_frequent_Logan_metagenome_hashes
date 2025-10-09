@@ -22,6 +22,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 from typing import List, Optional
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from tqdm import tqdm
 from .log import get_logger
 from .config import Paths
 from .io_aws import download_contigs, decompress_zstd
@@ -40,25 +42,29 @@ def cmd_build_index(args):
     split_parquet_to_shards(parquet_path, index_root, shard_bits=args.shard_bits)
     sort_shards(index_root, parallel=args.parallel)
 
-def cmd_annotate(args):
-    index_root = Path(args.index_root)
-    workdir = Path(args.workdir)
-    sig_dir = Path(args.sig_dir) if args.sig_dir else None
-    out_dir = workdir / "results"
-    out_dir.mkdir(parents=True, exist_ok=True)
+def _process_one_accession(task):
+    """
+    Top-level worker (picklable) to process a single accession end-to-end.
+    Returns a (accession, ok, out_path_or_msg) tuple.
+    """
+    acc, index_root_str, workdir_str, sig_dir_str, overwrite = task
+    try:
+        index_root = Path(index_root_str)
+        workdir = Path(workdir_str)
+        sig_dir = Path(sig_dir_str) if sig_dir_str else None
+        out_dir = workdir / "results"
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-    for acc in args.accessions:
-        LOGGER.info("Processing accession: %s", acc)
-        zst = download_contigs(acc, workdir / "contigs", overwrite=args.overwrite)
-        fasta = decompress_zstd(zst, overwrite=args.overwrite)
+        # Download + decompress contigs
+        zst = download_contigs(acc, workdir / "contigs", overwrite=overwrite)
+        fasta = decompress_zstd(zst, overwrite=overwrite)
 
+        # Optional signature
         sig_zip = None
         if sig_dir:
             cand = sig_dir / f"{acc}.unitigs.fa.sig.zip"
             if cand.exists():
                 sig_zip = cand
-            else:
-                LOGGER.warning("Signature not found: %s", cand)
 
         out = count_novel_hashes_for_accession(
             accession=acc,
@@ -67,7 +73,47 @@ def cmd_annotate(args):
             out_dir=out_dir,
             signature_zip=sig_zip
         )
-        LOGGER.info("Wrote: %s", out)
+        return (acc, True, str(out))
+    except Exception as e:
+        return (acc, False, f"{type(e).__name__}: {e}")
+
+def cmd_annotate(args):
+    index_root = Path(args.index_root)
+    workdir = Path(args.workdir)
+    sig_dir = Path(args.sig_dir) if args.sig_dir else None
+    out_dir = workdir / "results"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    tasks = [
+        (acc, str(index_root), str(workdir), str(sig_dir) if sig_dir else None, args.overwrite)
+        for acc in args.accessions
+    ]
+
+    if args.workers <= 1:
+        # Sequential (useful for debugging)
+        for t in tasks:
+            acc, ok, msg = _process_one_accession(t)
+            if ok:
+                LOGGER.info("✓ %s -> %s", acc, msg)
+            else:
+                LOGGER.error("✗ %s failed: %s", acc, msg)
+    else:
+        # Parallel with a picklable top-level worker
+        LOGGER.info("Starting parallel annotation with %d workers over %d accessions.",
+                    args.workers, len(tasks))
+        successes = 0
+        failures = 0
+        with ProcessPoolExecutor(max_workers=args.workers) as ex:
+            futures = [ex.submit(_process_one_accession, t) for t in tasks]
+            for fut in tqdm(as_completed(futures), total=len(futures), desc="accessions"):
+                acc, ok, msg = fut.result()
+                if ok:
+                    successes += 1
+                    LOGGER.info("✓ %s -> %s", acc, msg)
+                else:
+                    failures += 1
+                    LOGGER.error("✗ %s failed: %s", acc, msg)
+        LOGGER.info("Annotation complete. %d succeeded, %d failed.", successes, failures)
 
 def main():
     ap = argparse.ArgumentParser(prog="logan_darkmatter")
@@ -85,6 +131,7 @@ def main():
     ap_ann.add_argument("--workdir", required=True, help="Workspace (downloads, intermediate CSVs, results).")
     ap_ann.add_argument("--sig-dir", required=False, help="Directory containing [accession].unitigs.fa.sig.zip.")
     ap_ann.add_argument("--overwrite", action="store_true", help="Overwrite downloads/decompressions if they exist.")
+    ap_ann.add_argument("--workers", type=int, default=8, help="Number of parallel workers for accessions.")
     ap_ann.add_argument("accessions", nargs="+", help="SRA accessions to process.")
     ap_ann.set_defaults(func=cmd_annotate)
 
