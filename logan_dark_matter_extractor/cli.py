@@ -37,7 +37,7 @@ def cmd_build_index(args):
     index_root = Path(args.index_root)
     index_root.mkdir(parents=True, exist_ok=True)
     parquet_path = Path(args.parquet)
-    split_parquet_to_shards(parquet_path, index_root, shard_bits=args.shard_bits)
+    #split_parquet_to_shards(parquet_path, index_root, shard_bits=args.shard_bits)
     sort_shards(index_root, parallel=args.parallel)
 
 def cmd_annotate(args):
