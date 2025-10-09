@@ -21,6 +21,7 @@ The resulting index looks like:
 from __future__ import annotations
 
 import json, os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List
@@ -117,6 +118,32 @@ def split_parquet_to_shards(parquet_path: Path,
     LOGGER.info("Split complete. Wrote %s total items into %d shards.",
                 f"{int(counts.sum()):,}", shards)
 
+def _sort_one_shard(args):
+    """
+    Top-level worker (picklable) for ProcessPoolExecutor.
+    Args:
+      args: tuple (i:int, shards_dir:str)
+    Returns:
+      (i, n_items, status)
+    """
+    i, shards_dir_str = args
+    shards_dir = Path(shards_dir_str)
+    src = shards_dir / f"shard_{i:03d}.bin"
+    dst = shards_dir / f"shard_{i:03d}.sorted.u64"
+    if not src.exists():
+        return (i, 0, "missing")
+    if dst.exists():
+        return (i, os.path.getsize(dst) // 8, "exists")
+    # read all, sort, write
+    arr = np.fromfile(src, dtype=np.uint64)
+    if arr.size == 0:
+        # create an empty sorted file to mark completion
+        arr.tofile(dst)
+        return (i, 0, "empty")
+    arr.sort(kind="quicksort")
+    arr.tofile(dst)
+    return (i, int(arr.size), "sorted")
+
 def sort_shards(index_root: Path, parallel: int = 4):
     """
     Sort each shard file into a *.sorted.u64 file, optionally in parallel.
@@ -124,29 +151,13 @@ def sort_shards(index_root: Path, parallel: int = 4):
     For a 32B-row dataset with 256 shards, each shard averages ~1GB (125M u64).
     Sorting that many 64-bit ints in RAM is feasible and very fast on your machine.
     """
-    from concurrent.futures import ProcessPoolExecutor, as_completed
-
     shards_dir = index_root / "shards"
     meta = json.load(open(index_root / "meta.json"))
-    shards = meta["shards"]
+    shards = int(meta["shards"])
 
-    def _sort_one(i: int):
-        src = shards_dir / f"shard_{i:03d}.bin"
-        dst = shards_dir / f"shard_{i:03d}.sorted.u64"
-        if not src.exists():
-            return (i, 0, "missing")
-        if dst.exists():
-            return (i, os.path.getsize(dst) // 8, "exists")
-        # read all, sort, write
-        arr = np.fromfile(src, dtype=np.uint64)
-        arr.sort(kind="quicksort")
-        arr.tofile(dst)
-        return (i, len(arr), "sorted")
-
-    with ProcessPoolExecutor(max_workers=parallel) as ex:
-        futs = [ex.submit(_sort_one, i) for i in range(shards)]
-        for fut in tqdm(as_completed(futs), total=shards, desc="sorting shards"):
-            i, n, status = fut.result()
+    tasks = [(i, str(shards_dir)) for i in range(shards)]
+    if parallel <= 1:
+        # single-process fallback (no multiprocessing/pickling)
+        for t in tqdm(tasks, total=shards, desc="sorting shards"):
+            i, n, status = _sort_one_shard(t)
             LOGGER.info("Shard %03d: %s (%s items)", i, status, f"{n:,}")
-
-    LOGGER.info("Sorting complete.")
