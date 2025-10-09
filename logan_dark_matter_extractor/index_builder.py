@@ -161,3 +161,9 @@ def sort_shards(index_root: Path, parallel: int = 4):
         for t in tqdm(tasks, total=shards, desc="sorting shards"):
             i, n, status = _sort_one_shard(t)
             LOGGER.info("Shard %03d: %s (%s items)", i, status, f"{n:,}")
+    else:
+        with ProcessPoolExecutor(max_workers=parallel) as ex: futs = [ex.submit(_sort_one_shard, t) for t in tasks]
+        for fut in tqdm(as_completed(futs), total=shards, desc="sorting shards"):
+            i, n, status = fut.result()
+            LOGGER.info("Shard %03d: %s (%s items)", i, status, f"{n:,}")
+    LOGGER.info("Sorting complete.")
