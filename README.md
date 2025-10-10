@@ -24,7 +24,7 @@ The unique hashes for the Logan metagenomes was created using [python diff_bet_w
 
 First, I used `run_better_output_format.sh` which calls `top_minhashes_spark.py` which will get the hashes that are 
 in a lot of the samples. After doing this, I realized that lots of these were from things like conserved regions of 
-16S rRNA genes.
+16S rRNA genes. In any case, I stuck them all in a duckdb database using `create_duck_db_from_hive_partition.sh`.
 
 So then I went and created the [Known_microbe_hashes](https://github.com/KoslickiLab/known_microbe_hashes) repo which has the unique hashes for all the microbial databases I could get my hands on. 
 
@@ -34,16 +34,18 @@ I also added a generic left/right anti-join to get statistics about which refere
 unique to it; see `count_wgs_vs_others.sh` and `compare_alias_vs_others.sh`.
 
 I then wanted to decorate the novel Logan hashes with which samples they are in, as well as which samples contain 
-the most novel hashes. I used `associate_counts_to_samples_and_hashes.sh` to do this. This prepares the database for:
+the most novel hashes. I used `associate_counts_to_samples_and_hashes.sh` to do this. This prepares the database for 
+the next step.
 
 Next, I plotted the histogram of some of this data with `plot_sample_count_histogram.py`. I quickly learned 
 (`calculate_percentiles.py`) that 
 taking a percentile approach (eg. "give me the hashes that occur between the 75th and 90th percentile of sample 
 counts"; see `get_frequent_hashes.sh`) was not a good idea, as the distribution is very long-tailed. So I went with 
 `get_frequent_hashes_cuttoff.sh` which takes a hard cutoff (eg. "give me the hashes that occur in at least 100 
-samples but no more than 1,000,000").
+samples but no more than 1,000,000"). Note that I also did it the other way around: Find me samples that have lots 
+of these novel hashes.
 
-I then had a realization that I did not include the Serratus expansion of the Viral population. So I get those 
+I then had a realization that I did not include the Serratus expansion of the Viral population genomes. So I got those 
 unique hashes in the [Known_microbe_hashes](https://github.com/KoslickiLab/known_microbe_hashes). I then needed to 
 remove these hashes from the novel logan hashes between the cuttoff. This was accomplished with 
 `remove_Serratus_hashes_from_frequent_novel_hash_parquets.py` which can be run with its default parameters.

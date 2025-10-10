@@ -1,0 +1,9 @@
+pyarrow
+pandas
+tqdm
+biopython
+zstandard
+requests
+sourmash
+boto3
+python-zstandard
