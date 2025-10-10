@@ -9,4 +9,5 @@ python -m logan_dark_matter_extractor.cli annotate \
   --index-root /scratch/logan_darkmatter/novel_index \
   --workdir /scratch/logan_darkmatter/work \
   --sig-dir  /scratch/logan_darkmatter \
-  ERR10298221 ERR10298244 ERR10298246
+  --overwrite \
+  DRR019503 DRR045396 DRR045397 DRR067587 DRR067588 DRR067589 DRR067590 DRR067591 DRR092708
