@@ -56,5 +56,13 @@ located at:
 /scratch/dmk333_new/unclassified_frequent_Logan_metagenome_hashes/data/hash_and_sample_id_counts/hash_counts_25_10000/filtered_hashes_no_Serratus.parquet
 ```
 
-Next, I will start looking at samples which are enriched for these hashes, pull down their contigs, decorate them 
-with how many of these novel hashes they contain, and see if I can figure out what they are.
+Next, we can look at samples which are enriched for these hashes, pull down their contigs and decorate 
+them with how many of these novel hashes they contain. This is accomplished with the preparation script 
+`logan_dark_matter_extractor/scripts/0_build_index.sh` and then actually running it with 
+`logan_dark_matter_extractor/scripts/1_annotate_contigs_from_accession.sh`.
+
+Next, I discovered that I still have way too many candidates to sift through, so the plan is:
+
+1. For the frequently appearing, novel hashes, only count/include those samples that themselves have lots of novelty
+2. Consider including only WGS samples
+3. Consider only including those that have persisted over time
