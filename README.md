@@ -67,7 +67,7 @@ Next, I discovered that I still have way too many candidates to sift through, so
 2. Consider including only WGS samples
 3. Consider only including those that have persisted over time
 
-For 1. above, I will use `filter_by_sample_count.sh` to start with the file `filtered_hashes_no_Serratus.parquet`
+For 1. above, I will use `filter_sample_ids_by_threshold` to start with the file `filtered_hashes_no_Serratus.parquet`
 (which contains the hashes that show up in many (>=25) samples but not too many (<=10,000 samples) and then filter the 
 samples to only those that have lots of novelty (currently set to be "has 1000 or more novel hashes in that sample").
 This will give me a new set of hashes that are more enriched for novelty and are in samples that are enriched for 
