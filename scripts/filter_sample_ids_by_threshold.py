@@ -58,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--memory-limit",
         default="3500GB",
-        help="DuckDB memory limit (default: 3500GB for a 4TB RAM box). Accepts e.g. '250GB', '90%'.",
+        help="DuckDB memory limit (default: 3500GB for a 4TB RAM box). Accepts e.g. '250GB', '90%%'.",
     )
     p.add_argument(
         "--scratch-dir",
