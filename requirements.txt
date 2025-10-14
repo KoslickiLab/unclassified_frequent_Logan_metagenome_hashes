@@ -7,3 +7,5 @@ requests
 sourmash
 boto3
 python-zstandard
+duckdb-cli>=1.4.1
+python-duckdb>=1.4.1
