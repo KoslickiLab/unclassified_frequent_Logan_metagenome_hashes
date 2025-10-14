@@ -109,8 +109,6 @@ def configure_duckdb(con: duckdb.DuckDBPyConnection, threads: int, memory_limit:
     con.execute("PRAGMA enable_progress_bar=true;")
     con.execute("PRAGMA progress_bar_time=1000;")  # ms between updates
 
-    # Optional: help the optimizer with big joins/temp data
-    con.execute("PRAGMA force_parallelism=true;")
     # Keep default vector sizes and other internals; DuckDB is generally optimal out-of-the-box.
 
 
