@@ -25,6 +25,7 @@ import argparse
 import pathlib
 import sys
 import duckdb
+import os
 
 
 def build_sql(drop_empty: bool) -> str:
@@ -117,7 +118,8 @@ def main() -> int:
 
     con = duckdb.connect()
     # Optional: speed up if you want parallel reads
-    # con.execute("PRAGMA threads=%d" % os.cpu_count())
+    con.execute("PRAGMA threads=%d" % os.cpu_count())
+    con.execute("PRAGMA enable_progress_bar")
 
     # Execute parameterized SQL and write to parquet in one go
     # (DuckDB allows binding parameters into read_parquet and the WHERE threshold.)
